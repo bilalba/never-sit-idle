@@ -1,11 +1,11 @@
-"""Telegram bot for agent notifications and job intake.
+"""Telegram bot for agent notifications and conversational interaction.
 
 Uses the Bot API directly via requests — no extra dependencies.
 The bot can:
   - Send notifications (job done, queue empty, shutting down)
   - Long-poll for user messages, batch-draining all pending
   - Handle commands: /jobs, /status, /help, /queue, /cancel
-  - Queue plain-text messages as research topics with confirmation
+  - Route plain-text messages through the agent for conversational replies
 """
 
 from __future__ import annotations
@@ -22,6 +22,30 @@ from agent import config
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+TELEGRAM_MAX_LENGTH = 4096
+
+
+def _split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list[str]:
+    """Split text into chunks that fit within Telegram's message limit.
+
+    Tries to break at newlines, falls back to hard split.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Try to break at last newline within limit
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            # No good newline — hard split
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
 
 
 @dataclass
@@ -88,6 +112,18 @@ class TelegramBot:
     def reply(self, msg: IncomingMessage, text: str) -> dict[str, Any] | None:
         """Reply to a specific incoming message."""
         return self.send(text, reply_to=msg.message_id)
+
+    def send_long(
+        self,
+        text: str,
+        reply_to: int | None = None,
+        parse_mode: str = "Markdown",
+        limit: int = 4096,
+    ) -> None:
+        """Send a message, splitting into chunks if it exceeds Telegram's limit."""
+        for chunk in _split_message(text, limit):
+            self.send(chunk, parse_mode=parse_mode, reply_to=reply_to)
+            reply_to = None  # only first chunk is a reply
 
     def notify_idle(self, completed_count: int = 0) -> None:
         """Tell the user the queue is empty and ask for work."""
@@ -234,7 +270,8 @@ class TelegramBot:
             "/cancel `job-id` — cancel a queued job\n"
             "/clear — remove done/failed jobs\n"
             "/help — this message\n"
-            "\nOr just send a topic and I'll queue it as research."
+            "\nOr just send me a message — I'll check the KB, "
+            "answer questions, or queue research as needed."
         ))
 
     def _cmd_jobs(self, msg: IncomingMessage, Q: Any) -> None:

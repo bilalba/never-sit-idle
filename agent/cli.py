@@ -22,7 +22,14 @@ from pathlib import Path
 from agent import config
 from agent import queue as Q
 from agent.agent import Agent
-from agent.prompts import EXPLORE_CODEBASE_PROMPT, RESEARCH_TOPIC_PROMPT, QUERY_KB_PROMPT
+from agent.memory import SystemPrompt
+from agent.prompts import (
+    EXPLORE_CODEBASE_PROMPT,
+    RESEARCH_TOPIC_PROMPT,
+    QUERY_KB_PROMPT,
+    SYSTEM_PROMPT,
+    TELEGRAM_CHAT_SYSTEM,
+)
 from agent.telegram import TelegramBot
 
 
@@ -104,11 +111,38 @@ def _prompt_for_job(job: dict, task_dir: str) -> str:
         return RESEARCH_TOPIC_PROMPT.format(topic=subject, task_dir=task_dir)
 
 
+def _handle_telegram_message(
+    agent: Agent,
+    bot: TelegramBot,
+    msg: 'IncomingMessage',
+    logger: logging.Logger,
+) -> None:
+    """Route a plain-text Telegram message through the agent and reply."""
+    # Ensure agent is in Telegram chat mode
+    agent.system_prompt.text = TELEGRAM_CHAT_SYSTEM
+
+    try:
+        result = agent.run(msg.text)
+    except Exception as exc:
+        logger.exception("Agent error handling Telegram message: %s", exc)
+        bot.reply(msg, f"Sorry, something went wrong: {exc}")
+        return
+
+    if result.strip():
+        bot.send_long(result.strip(), reply_to=msg.message_id)
+    else:
+        bot.reply(msg, "(No response)")
+
+
 def _run_job(agent: Agent, job: dict, logger: logging.Logger) -> None:
     """Execute a single job: name task, run agent, update job status."""
     job_id = job["id"]
     job_type = job["type"]
     subject = job["subject"]
+
+    # Reset conversation context and restore the standard system prompt
+    agent.reset_conversation()
+    agent.system_prompt.text = SYSTEM_PROMPT
 
     Q.mark_running(job_id)
 
@@ -141,8 +175,6 @@ def _run_job(agent: Agent, job: dict, logger: logging.Logger) -> None:
         logger.exception("Job %s failed: %s", job_id, exc)
         Q.mark_failed(job_id, error=str(exc))
         raise
-
-    agent.reset_conversation()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -282,9 +314,8 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 if pending:
                     topics = bot.handle_commands(pending, Q, agent_stats=agent.stats())
                     for msg in topics:
-                        new_job = Q.add(Q.RESEARCH, msg.text)
-                        bot.reply(msg, f"\U0001f4cb Queued: *{msg.text}*")
-                        logger.info("Queued job %s from Telegram (between jobs): %s", new_job["id"], msg.text[:100])
+                        logger.info("Routing Telegram message through agent (between jobs): %s", msg.text[:100])
+                        _handle_telegram_message(agent, bot, msg, logger)
 
             write_status({
                 "mode": "daemon", "state": "idle",
@@ -297,7 +328,7 @@ def cmd_daemon(args: argparse.Namespace) -> None:
 
         # ── Queue is empty ────────────────────────────────────────
         if bot.enabled:
-            logger.info("Queue empty — asking Telegram for work")
+            logger.info("Queue empty — waiting for Telegram messages")
             bot.notify_idle(completed_count=jobs_completed)
 
             write_status({
@@ -306,27 +337,24 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 "pid": os.getpid(),
             })
 
-            # Long-poll Telegram until we get at least one topic
+            # Long-poll Telegram — route messages through the agent
             while not shutdown:
                 messages = bot.poll_messages(timeout=30)
                 if not messages:
+                    # Check if a job appeared (e.g. from external CLI `add`)
+                    if Q.queue_size() > 0:
+                        break
                     continue
 
-                # Handle commands inline, get back plain-text topics
+                # Handle commands inline, get back plain-text messages
                 topics = bot.handle_commands(messages, Q, agent_stats=agent.stats())
 
-                # Queue each topic with a reply confirmation
+                # Route each message through the agent
                 for msg in topics:
-                    new_job = Q.add(Q.RESEARCH, msg.text)
-                    bot.reply(msg, f"\U0001f4cb Queued: *{msg.text}*")
-                    logger.info("Queued job %s from Telegram: %s", new_job["id"], msg.text[:100])
+                    logger.info("Routing Telegram message through agent: %s", msg.text[:100])
+                    _handle_telegram_message(agent, bot, msg, logger)
 
-                # If we queued any topics, break out to process them
-                if topics:
-                    break
-
-                # If it was only commands, keep polling
-                # (also re-check the queue in case /queue added something)
+                # If the agent queued any jobs, break out to process them
                 if Q.queue_size() > 0:
                     break
 

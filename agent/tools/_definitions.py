@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent import queue as Q
 from agent.config import ALPHA_VANTAGE_API_KEY
 from agent.knowledge_base import KnowledgeBase
 from agent.memory import LongTermMemory, WorkingMemory
@@ -410,6 +411,19 @@ def build_registry(
             "limit": {"type": "integer", "description": "Max articles (default 10)"},
         }),
         lambda tickers="", topics="", limit=10: alphavantage.news_sentiment(tickers, topics, limit),
+    )
+
+    # ── Job queue ─────────────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("queue_research", "Queue a topic for deep background research (runs asynchronously)", {
+            "topic": {"type": "string", "description": "The topic to research"},
+        }, ["topic"]),
+        lambda topic: {
+            "queued": True,
+            "job_id": Q.add(Q.RESEARCH, topic)["id"],
+            "topic": topic,
+        },
     )
 
     # ── Utility ───────────────────────────────────────────────────────

@@ -1,11 +1,12 @@
 """Tests for the Telegram bot integration."""
 
 import json
+import logging
 import pytest
 from unittest.mock import patch, MagicMock, call
 from types import SimpleNamespace
 
-from agent.telegram import TelegramBot, IncomingMessage
+from agent.telegram import TelegramBot, IncomingMessage, _split_message
 
 
 def _ok_response(result=None):
@@ -364,3 +365,141 @@ class TestHandleCommands:
         Q.clear_done.assert_called_once()
         reply_text = bot.reply.call_args.args[1]
         assert "4" in reply_text
+
+
+class TestSplitMessage:
+    def test_short_message_not_split(self):
+        assert _split_message("hello") == ["hello"]
+
+    def test_exact_limit_not_split(self):
+        text = "a" * 4096
+        assert _split_message(text) == [text]
+
+    def test_splits_at_newline(self):
+        # Two blocks separated by a newline near the limit
+        block1 = "a" * 100
+        block2 = "b" * 100
+        text = block1 + "\n" + block2
+        chunks = _split_message(text, limit=105)
+        assert len(chunks) == 2
+        assert chunks[0] == block1
+        assert chunks[1] == block2
+
+    def test_hard_split_when_no_newline(self):
+        text = "a" * 200
+        chunks = _split_message(text, limit=80)
+        assert len(chunks) == 3
+        assert chunks[0] == "a" * 80
+        assert chunks[1] == "a" * 80
+        assert chunks[2] == "a" * 40
+
+    def test_empty_string(self):
+        assert _split_message("") == [""]
+
+    def test_multiple_chunks(self):
+        lines = [f"Line {i}" for i in range(100)]
+        text = "\n".join(lines)
+        chunks = _split_message(text, limit=100)
+        assert len(chunks) > 1
+        # All original content preserved
+        reassembled = "\n".join(chunks)
+        assert reassembled == text
+
+
+class TestSendLong:
+    @patch("agent.telegram.requests.post")
+    def test_short_message_single_send(self, mock_post):
+        mock_post.return_value = _ok_response({"message_id": 1})
+        bot = TelegramBot(token="tok", chat_id="123")
+        bot.send_long("short message", reply_to=42)
+        assert mock_post.call_count == 1
+        body = mock_post.call_args.kwargs["json"]
+        assert body["reply_to_message_id"] == 42
+
+    @patch("agent.telegram.requests.post")
+    def test_long_message_multiple_sends(self, mock_post):
+        mock_post.return_value = _ok_response({"message_id": 1})
+        bot = TelegramBot(token="tok", chat_id="123")
+        text = "a" * 100 + "\n" + "b" * 100
+        bot.send_long(text, reply_to=42, limit=105)
+        assert mock_post.call_count == 2
+        # First call has reply_to, second doesn't
+        first_body = mock_post.call_args_list[0].kwargs["json"]
+        assert first_body["reply_to_message_id"] == 42
+        second_body = mock_post.call_args_list[1].kwargs["json"]
+        assert "reply_to_message_id" not in second_body
+
+
+class TestHandleTelegramMessage:
+    """Tests for the _handle_telegram_message helper in cli.py."""
+
+    def test_routes_message_through_agent(self):
+        from agent.cli import _handle_telegram_message
+        from agent.prompts import TELEGRAM_CHAT_SYSTEM
+
+        agent = MagicMock()
+        agent.run.return_value = "Here's what I know about React hooks..."
+        agent.system_prompt = MagicMock()
+
+        bot = MagicMock()
+        msg = IncomingMessage("what do we know about React hooks?", 10, False, "", "")
+        logger = logging.getLogger("test")
+
+        _handle_telegram_message(agent, bot, msg, logger)
+
+        agent.run.assert_called_once_with("what do we know about React hooks?")
+        bot.send_long.assert_called_once_with(
+            "Here's what I know about React hooks...", reply_to=10,
+        )
+        # Should have set the Telegram system prompt
+        assert agent.system_prompt.text == TELEGRAM_CHAT_SYSTEM
+
+    def test_handles_agent_error_gracefully(self):
+        from agent.cli import _handle_telegram_message
+
+        agent = MagicMock()
+        agent.run.side_effect = RuntimeError("LLM exploded")
+        agent.system_prompt = MagicMock()
+
+        bot = MagicMock()
+        msg = IncomingMessage("test", 11, False, "", "")
+        logger = logging.getLogger("test")
+
+        _handle_telegram_message(agent, bot, msg, logger)
+
+        bot.reply.assert_called_once()
+        reply_text = bot.reply.call_args.args[1]
+        assert "something went wrong" in reply_text
+
+    def test_handles_empty_response(self):
+        from agent.cli import _handle_telegram_message
+
+        agent = MagicMock()
+        agent.run.return_value = "  "
+        agent.system_prompt = MagicMock()
+
+        bot = MagicMock()
+        msg = IncomingMessage("test", 12, False, "", "")
+        logger = logging.getLogger("test")
+
+        _handle_telegram_message(agent, bot, msg, logger)
+
+        bot.reply.assert_called_once()
+        reply_text = bot.reply.call_args.args[1]
+        assert "No response" in reply_text
+
+    def test_does_not_reset_conversation(self):
+        """Telegram messages should keep conversation context."""
+        from agent.cli import _handle_telegram_message
+
+        agent = MagicMock()
+        agent.run.return_value = "answer"
+        agent.system_prompt = MagicMock()
+
+        bot = MagicMock()
+        msg = IncomingMessage("test", 13, False, "", "")
+        logger = logging.getLogger("test")
+
+        _handle_telegram_message(agent, bot, msg, logger)
+
+        agent.reset_conversation.assert_not_called()

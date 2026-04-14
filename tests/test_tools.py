@@ -158,6 +158,7 @@ class TestBuiltRegistry:
             "feed_discover", "feed_fetch",
             "yfinance_search", "yfinance_quote", "yfinance_news",
             "alphavantage_search", "alphavantage_quote", "alphavantage_news",
+            "queue_research",
             "rate_limit_stats", "think",
         ]
         for name in expected:
@@ -195,6 +196,12 @@ class TestBuiltRegistry:
     def test_think_tool(self, registry):
         result = json.loads(registry.execute("think", {"thought": "I should research this"}))
         assert result["acknowledged"] is True
+
+    def test_queue_research_tool(self, registry):
+        result = json.loads(registry.execute("queue_research", {"topic": "WebSocket performance"}))
+        assert result["queued"] is True
+        assert result["topic"] == "WebSocket performance"
+        assert "job_id" in result
 
     def test_rate_limit_stats(self, registry):
         result = json.loads(registry.execute("rate_limit_stats", {}))

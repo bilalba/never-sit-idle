@@ -153,6 +153,11 @@ class TestBuiltRegistry:
             "stackexchange_search", "stackexchange_answers",
             "github_search_repos", "github_readme",
             "web_fetch",
+            "google_news_search", "google_news_topic",
+            "gdelt_search", "gdelt_tone",
+            "feed_discover", "feed_fetch",
+            "yfinance_search", "yfinance_quote", "yfinance_news",
+            "alphavantage_search", "alphavantage_quote", "alphavantage_news",
             "rate_limit_stats", "think",
         ]
         for name in expected:

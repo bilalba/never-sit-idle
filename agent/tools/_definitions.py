@@ -1,126 +1,29 @@
-"""Tool registry and implementations for the agent.
-
-Tools available to the LLM:
-    File system:      read_file, glob_files, grep_files
-    Knowledge base:   kb_write, kb_read, kb_delete, kb_list, kb_search, kb_tree
-    Memory:           memory_store, memory_retrieve, memory_delete, memory_list, memory_search
-    Working memory:   wm_set, wm_get, wm_delete, wm_list
-    Data sources:     reddit_search, reddit_top, reddit_comments,
-                      wikipedia_search, wikipedia_article,
-                      hackernews_search, hackernews_top,
-                      stackexchange_search, stackexchange_answers,
-                      github_search_repos, github_readme,
-                      web_fetch
-    Utility:          rate_limit_stats, think
-"""
+"""Tool definitions: registers all tools into a ToolRegistry."""
 
 from __future__ import annotations
 
-import fnmatch
-import json
-import logging
-import os
-import re
 from pathlib import Path
-from typing import Any, Callable
 
+from agent.config import ALPHA_VANTAGE_API_KEY
 from agent.knowledge_base import KnowledgeBase
 from agent.memory import LongTermMemory, WorkingMemory
 from agent.sources import (
+    AlphaVantageClient,
+    FeedsearchClient,
+    GDELTClient,
     GitHubClient,
+    GoogleNewsClient,
     HackerNewsClient,
     RedditClient,
     StackExchangeClient,
     WebFetcher,
     WikipediaClient,
+    YFinanceClient,
     rate_limiter,
 )
 
-logger = logging.getLogger(__name__)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Tool schema type (OpenAI-compatible function calling)
-# ═══════════════════════════════════════════════════════════════════════════
-
-ToolDef = dict[str, Any]  # {"type": "function", "function": {...}}
-
-
-def _func_tool(
-    name: str,
-    description: str,
-    parameters: dict[str, Any],
-    required: list[str] | None = None,
-) -> ToolDef:
-    """Build an OpenAI-compatible tool definition."""
-    props = parameters
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": props,
-                "required": required or [],
-            },
-        },
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Tool Registry
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class ToolRegistry:
-    """Maps tool names → (schema, handler) pairs."""
-
-    def __init__(self) -> None:
-        self._tools: dict[str, tuple[ToolDef, Callable[..., Any]]] = {}
-
-    def register(self, schema: ToolDef, handler: Callable[..., Any]) -> None:
-        name = schema["function"]["name"]
-        self._tools[name] = (schema, handler)
-
-    def get_schemas(self) -> list[ToolDef]:
-        return [schema for schema, _ in self._tools.values()]
-
-    def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool by name. Returns JSON string result.
-
-        Strips any unexpected keyword arguments that the LLM may inject
-        (e.g. Gemma adding 'id' fields) to prevent TypeErrors.
-        """
-        if name not in self._tools:
-            return json.dumps({"error": f"Unknown tool: {name}"})
-        schema, handler = self._tools[name]
-        try:
-            # Filter arguments to only those declared in the schema
-            declared_params = set(
-                schema.get("function", {})
-                .get("parameters", {})
-                .get("properties", {})
-                .keys()
-            )
-            if declared_params:
-                filtered = {k: v for k, v in arguments.items() if k in declared_params}
-            else:
-                filtered = arguments
-            result = handler(**filtered)
-            if isinstance(result, str):
-                return result
-            return json.dumps(result, indent=2, default=str)
-        except Exception as exc:
-            logger.exception("Tool %s failed", name)
-            return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
-
-    def list_names(self) -> list[str]:
-        return list(self._tools.keys())
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Build the default registry
-# ═══════════════════════════════════════════════════════════════════════════
+from ._registry import ToolRegistry, _func_tool
+from ._filesystem import _read_file, _glob_files, _grep_files
 
 
 def build_registry(
@@ -141,6 +44,11 @@ def build_registry(
     stackexchange = StackExchangeClient()
     github = GitHubClient()
     web = WebFetcher()
+    google_news = GoogleNewsClient()
+    gdelt = GDELTClient()
+    feedsearch = FeedsearchClient()
+    yfinance = YFinanceClient()
+    alphavantage = AlphaVantageClient(api_key=ALPHA_VANTAGE_API_KEY)
 
     # ── File system ───────────────────────────────────────────────────
 
@@ -399,6 +307,111 @@ def build_registry(
         lambda url: web.fetch(url),
     )
 
+    # ── Google News ───────────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("google_news_search", "Search Google News for articles (returns titles, links, sources)", {
+            "query": {"type": "string", "description": "Search query"},
+            "limit": {"type": "integer", "description": "Max results (default 10)"},
+        }, ["query"]),
+        lambda query, limit=10: google_news.search(query, limit),
+    )
+
+    registry.register(
+        _func_tool("google_news_topic", "Get Google News for a topic (WORLD, BUSINESS, TECHNOLOGY, etc.)", {
+            "topic": {"type": "string", "description": "Topic: WORLD, NATION, BUSINESS, TECHNOLOGY, SCIENCE, HEALTH, SPORTS, ENTERTAINMENT"},
+            "limit": {"type": "integer", "description": "Max results (default 10)"},
+        }, ["topic"]),
+        lambda topic, limit=10: google_news.topic(topic, limit),
+    )
+
+    # ── GDELT ────────────────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("gdelt_search", "Search GDELT global news (includes tone/sentiment scores)", {
+            "query": {"type": "string", "description": "Search keywords"},
+            "limit": {"type": "integer", "description": "Max results (default 10)"},
+            "timespan": {"type": "string", "description": "Time span: '7d', '30d', '1y' (default '7d')"},
+        }, ["query"]),
+        lambda query, limit=10, timespan="7d": gdelt.search(query, limit=limit, timespan=timespan),
+    )
+
+    registry.register(
+        _func_tool("gdelt_tone", "Get GDELT tone/sentiment timeline for a topic", {
+            "query": {"type": "string", "description": "Search keywords"},
+            "timespan": {"type": "string", "description": "Time span: '7d', '30d', '1y' (default '30d')"},
+        }, ["query"]),
+        lambda query, timespan="30d": gdelt.tone_chart(query, timespan),
+    )
+
+    # ── Feed discovery ───────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("feed_discover", "Discover RSS/Atom feeds for a website", {
+            "url": {"type": "string", "description": "Website URL to discover feeds for"},
+        }, ["url"]),
+        lambda url: feedsearch.discover(url),
+    )
+
+    registry.register(
+        _func_tool("feed_fetch", "Fetch and parse an RSS/Atom feed", {
+            "feed_url": {"type": "string", "description": "RSS/Atom feed URL"},
+            "limit": {"type": "integer", "description": "Max items (default 10)"},
+        }, ["feed_url"]),
+        lambda feed_url, limit=10: feedsearch.fetch_feed(feed_url, limit),
+    )
+
+    # ── Yahoo Finance ────────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("yfinance_search", "Search Yahoo Finance for tickers/companies", {
+            "query": {"type": "string", "description": "Search query (company name or ticker)"},
+            "limit": {"type": "integer", "description": "Max results (default 5)"},
+        }, ["query"]),
+        lambda query, limit=5: yfinance.search(query, limit),
+    )
+
+    registry.register(
+        _func_tool("yfinance_quote", "Get current stock quote from Yahoo Finance", {
+            "symbol": {"type": "string", "description": "Ticker symbol (e.g. AAPL, MSFT)"},
+        }, ["symbol"]),
+        lambda symbol: yfinance.quote(symbol),
+    )
+
+    registry.register(
+        _func_tool("yfinance_news", "Get news for a stock ticker via Yahoo Finance RSS", {
+            "symbol": {"type": "string", "description": "Ticker symbol"},
+            "limit": {"type": "integer", "description": "Max articles (default 10)"},
+        }, ["symbol"]),
+        lambda symbol, limit=10: yfinance.news(symbol, limit),
+    )
+
+    # ── Alpha Vantage ────────────────────────────────────────────────
+
+    registry.register(
+        _func_tool("alphavantage_search", "Search Alpha Vantage for tickers/companies", {
+            "query": {"type": "string", "description": "Search keywords"},
+            "limit": {"type": "integer", "description": "Max results (default 5)"},
+        }, ["query"]),
+        lambda query, limit=5: alphavantage.search(query, limit),
+    )
+
+    registry.register(
+        _func_tool("alphavantage_quote", "Get stock quote from Alpha Vantage (with change data)", {
+            "symbol": {"type": "string", "description": "Ticker symbol"},
+        }, ["symbol"]),
+        lambda symbol: alphavantage.quote(symbol),
+    )
+
+    registry.register(
+        _func_tool("alphavantage_news", "Get news with sentiment scores from Alpha Vantage", {
+            "tickers": {"type": "string", "description": "Comma-separated tickers (e.g. 'AAPL,MSFT'). Optional."},
+            "topics": {"type": "string", "description": "Comma-separated topics (e.g. 'technology,earnings'). Optional."},
+            "limit": {"type": "integer", "description": "Max articles (default 10)"},
+        }),
+        lambda tickers="", topics="", limit=10: alphavantage.news_sentiment(tickers, topics, limit),
+    )
+
     # ── Utility ───────────────────────────────────────────────────────
 
     registry.register(
@@ -414,65 +427,3 @@ def build_registry(
     )
 
     return registry
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# File-system tool implementations
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def _read_file(root: Path, path: str, max_lines: int) -> dict[str, Any]:
-    target = (root / path).resolve()
-    # Safety: don't escape codebase root
-    if not str(target).startswith(str(root.resolve())):
-        return {"error": "Path escapes codebase root"}
-    if not target.exists():
-        return {"error": f"File not found: {path}"}
-    if not target.is_file():
-        return {"error": f"Not a file: {path}"}
-    try:
-        lines = target.read_text(errors="replace").splitlines()
-        truncated = len(lines) > max_lines
-        content = "\n".join(lines[:max_lines])
-        return {
-            "path": path,
-            "content": content,
-            "lines": len(lines),
-            "truncated": truncated,
-        }
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-def _glob_files(root: Path, pattern: str) -> list[str]:
-    matches = sorted(str(p.relative_to(root)) for p in root.glob(pattern) if p.is_file())
-    return matches[:200]  # cap results
-
-
-def _grep_files(root: Path, pattern: str, file_glob: str) -> list[dict[str, Any]]:
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
-        return [{"error": f"Invalid regex: {exc}"}]
-
-    results: list[dict[str, Any]] = []
-    for fpath in root.rglob(file_glob):
-        if not fpath.is_file():
-            continue
-        # Skip binary / large files
-        if fpath.stat().st_size > 1_000_000:
-            continue
-        try:
-            text = fpath.read_text(errors="replace")
-        except Exception:
-            continue
-        for i, line in enumerate(text.splitlines(), 1):
-            if regex.search(line):
-                results.append({
-                    "file": str(fpath.relative_to(root)),
-                    "line": i,
-                    "text": line.strip()[:300],
-                })
-                if len(results) >= 100:
-                    return results
-    return results

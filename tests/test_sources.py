@@ -9,12 +9,18 @@ from agent.sources import (
     RateLimiter,
     rate_limiter,
     _rate_limited_get,
-    RedditClient,
-    WikipediaClient,
-    HackerNewsClient,
-    StackExchangeClient,
+    _parse_rss_items,
+    AlphaVantageClient,
+    FeedsearchClient,
+    GDELTClient,
     GitHubClient,
+    GoogleNewsClient,
+    HackerNewsClient,
+    RedditClient,
+    StackExchangeClient,
     WebFetcher,
+    WikipediaClient,
+    YFinanceClient,
     _strip_html,
 )
 
@@ -90,6 +96,11 @@ class TestRateLimiter:
         assert "stackexchange" in names
         assert "github" in names
         assert "web" in names
+        assert "googlenews" in names
+        assert "gdelt" in names
+        assert "feedsearch" in names
+        assert "yfinance" in names
+        assert "alphavantage" in names
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -98,7 +109,7 @@ class TestRateLimiter:
 
 
 class TestRateLimitedGet:
-    @patch("agent.sources.requests.get")
+    @patch("agent.sources._base.requests.get")
     def test_success(self, mock_get):
         resp = MagicMock()
         resp.status_code = 200
@@ -108,7 +119,7 @@ class TestRateLimitedGet:
         result = _rate_limited_get("wikipedia", "https://example.com")
         assert result == resp
 
-    @patch("agent.sources.requests.get")
+    @patch("agent.sources._base.requests.get")
     def test_retry_on_429(self, mock_get):
         resp_429 = MagicMock()
         resp_429.status_code = 429
@@ -122,7 +133,7 @@ class TestRateLimitedGet:
         result = _rate_limited_get("wikipedia", "https://example.com", max_retries=3)
         assert result.status_code == 200
 
-    @patch("agent.sources.requests.get")
+    @patch("agent.sources._base.requests.get")
     def test_retry_on_500(self, mock_get):
         resp_500 = MagicMock()
         resp_500.status_code = 500
@@ -136,7 +147,7 @@ class TestRateLimitedGet:
         result = _rate_limited_get("wikipedia", "https://example.com", max_retries=3)
         assert result.status_code == 200
 
-    @patch("agent.sources.requests.get")
+    @patch("agent.sources._base.requests.get")
     def test_raises_on_client_error(self, mock_get):
         import requests
         resp = MagicMock()
@@ -155,7 +166,7 @@ class TestRateLimitedGet:
 
 
 class TestRedditClient:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._reddit._rate_limited_get")
     def test_search_all(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "data": {"children": [
@@ -175,7 +186,7 @@ class TestRedditClient:
         assert results[0]["title"] == "Test Post"
         assert results[0]["score"] == 42
 
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._reddit._rate_limited_get")
     def test_search_subreddit(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "data": {"children": [
@@ -188,7 +199,7 @@ class TestRedditClient:
         results = client.search_subreddit("test", "query")
         assert len(results) == 1
 
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._reddit._rate_limited_get")
     def test_get_post_comments(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: [
             {"data": {"children": [
@@ -210,7 +221,7 @@ class TestRedditClient:
 
 
 class TestWikipediaClient:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._wikipedia._rate_limited_get")
     def test_search(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "query": {"search": [
@@ -224,7 +235,7 @@ class TestWikipediaClient:
         assert len(results) == 1
         assert results[0]["title"] == "Python (programming language)"
 
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._wikipedia._rate_limited_get")
     def test_get_summary(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "title": "Python",
@@ -239,7 +250,7 @@ class TestWikipediaClient:
 
 
 class TestHackerNewsClient:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._hackernews._rate_limited_get")
     def test_search(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "hits": [
@@ -255,7 +266,7 @@ class TestHackerNewsClient:
 
 
 class TestStackExchangeClient:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._stackexchange._rate_limited_get")
     def test_search(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "items": [
@@ -273,7 +284,7 @@ class TestStackExchangeClient:
 
 
 class TestGitHubClient:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._github._rate_limited_get")
     def test_search_repos(self, mock_get):
         mock_get.return_value = MagicMock(json=lambda: {
             "items": [
@@ -289,7 +300,7 @@ class TestGitHubClient:
 
 
 class TestWebFetcher:
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._web._rate_limited_get")
     def test_fetch_html(self, mock_get):
         resp = MagicMock()
         resp.headers = {"Content-Type": "text/html"}
@@ -301,7 +312,7 @@ class TestWebFetcher:
         assert "Hello world" in result["content"]
         assert result["type"] == "html"
 
-    @patch("agent.sources._rate_limited_get")
+    @patch("agent.sources._web._rate_limited_get")
     def test_fetch_json(self, mock_get):
         resp = MagicMock()
         resp.headers = {"Content-Type": "application/json"}
@@ -337,3 +348,318 @@ class TestStripHtml:
     def test_empty(self):
         assert _strip_html("") == ""
         assert _strip_html(None) == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RSS parsing
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestParseRssItems:
+    def test_basic_rss(self):
+        xml = """<?xml version="1.0"?>
+        <rss><channel>
+            <item>
+                <title>Breaking News</title>
+                <link>https://example.com/1</link>
+                <pubDate>Mon, 01 Jan 2024 00:00:00 GMT</pubDate>
+                <source>Example</source>
+            </item>
+            <item>
+                <title>Other News</title>
+                <link>https://example.com/2</link>
+            </item>
+        </channel></rss>"""
+        items = _parse_rss_items(xml, 10)
+        assert len(items) == 2
+        assert items[0]["title"] == "Breaking News"
+        assert items[0]["link"] == "https://example.com/1"
+        assert items[1]["title"] == "Other News"
+
+    def test_limit(self):
+        xml = """<?xml version="1.0"?>
+        <rss><channel>
+            <item><title>A</title></item>
+            <item><title>B</title></item>
+            <item><title>C</title></item>
+        </channel></rss>"""
+        items = _parse_rss_items(xml, 2)
+        assert len(items) == 2
+
+    def test_bad_xml(self):
+        assert _parse_rss_items("not xml at all", 10) == []
+
+    def test_html_description_stripped(self):
+        xml = """<?xml version="1.0"?>
+        <rss><channel>
+            <item>
+                <title>Test</title>
+                <description>&lt;p&gt;Hello &lt;b&gt;world&lt;/b&gt;&lt;/p&gt;</description>
+            </item>
+        </channel></rss>"""
+        items = _parse_rss_items(xml, 10)
+        assert len(items) == 1
+        assert "<" not in items[0].get("description", "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Google News
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGoogleNewsClient:
+    @patch("agent.sources._news._rate_limited_get")
+    def test_search(self, mock_get):
+        mock_get.return_value = MagicMock(text="""<?xml version="1.0"?>
+        <rss><channel>
+            <item>
+                <title>AI takes over - CNN</title>
+                <link>https://news.google.com/123</link>
+                <pubDate>Mon, 01 Jan 2024 12:00:00 GMT</pubDate>
+                <source url="https://cnn.com">CNN</source>
+            </item>
+        </channel></rss>""")
+        client = GoogleNewsClient()
+        results = client.search("AI")
+        assert len(results) == 1
+        assert results[0]["title"] == "AI takes over - CNN"
+        assert results[0]["source"] == "CNN"
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_topic(self, mock_get):
+        mock_get.return_value = MagicMock(text="""<?xml version="1.0"?>
+        <rss><channel>
+            <item><title>Tech News</title><link>https://example.com</link></item>
+        </channel></rss>""")
+        client = GoogleNewsClient()
+        results = client.topic("TECHNOLOGY")
+        assert len(results) == 1
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_empty_response(self, mock_get):
+        mock_get.return_value = MagicMock(text="<?xml version='1.0'?><rss><channel></channel></rss>")
+        client = GoogleNewsClient()
+        results = client.search("nonexistent topic xyzzy")
+        assert results == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GDELT
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGDELTClient:
+    @patch("agent.sources._news._rate_limited_get")
+    def test_search(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "articles": [
+                {"title": "AI article", "url": "https://example.com/ai",
+                 "domain": "example.com", "language": "English",
+                 "seendate": "20240101T120000Z", "tone": -2.5,
+                 "socialimage": ""},
+            ]
+        })
+        client = GDELTClient()
+        results = client.search("artificial intelligence")
+        assert len(results) == 1
+        assert results[0]["title"] == "AI article"
+        assert results[0]["tone"] == -2.5
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_tone_chart(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "timeline": [{"date": "2024-01-01", "tone": 1.5}]
+        })
+        client = GDELTClient()
+        result = client.tone_chart("bitcoin")
+        assert "timeline" in result
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_search_bad_json(self, mock_get):
+        mock_get.return_value = MagicMock(json=MagicMock(side_effect=ValueError))
+        client = GDELTClient()
+        results = client.search("test")
+        assert results == []
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_tone_chart_bad_json(self, mock_get):
+        mock_get.return_value = MagicMock(json=MagicMock(side_effect=ValueError))
+        client = GDELTClient()
+        result = client.tone_chart("test")
+        assert result == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feedsearch
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestFeedsearchClient:
+    def test_extract_link_feeds(self):
+        html = '''<html><head>
+            <link rel="alternate" type="application/rss+xml" title="Blog" href="/feed.xml">
+            <link rel="alternate" type="application/atom+xml" title="Atom" href="https://example.com/atom.xml">
+        </head></html>'''
+        client = FeedsearchClient()
+        feeds = client._extract_link_feeds(html, "https://example.com")
+        assert len(feeds) == 2
+        assert feeds[0]["url"] == "https://example.com/feed.xml"
+        assert feeds[0]["title"] == "Blog"
+        assert feeds[1]["url"] == "https://example.com/atom.xml"
+
+    def test_base_url(self):
+        assert FeedsearchClient._base_url("https://example.com/blog/page") == "https://example.com"
+        assert FeedsearchClient._base_url("http://sub.example.com/a/b") == "http://sub.example.com"
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_discover_from_html(self, mock_get):
+        html_resp = MagicMock()
+        html_resp.text = '<html><head><link rel="alternate" type="application/rss+xml" href="/rss"></head></html>'
+        html_resp.headers = {"Content-Type": "text/html"}
+
+        # The common-path probes will fail
+        mock_get.side_effect = [html_resp] + [Exception("not found")] * 10
+        client = FeedsearchClient()
+        feeds = client.discover("https://example.com")
+        assert len(feeds) >= 1
+        assert feeds[0]["url"] == "https://example.com/rss"
+
+    @patch("agent.sources._news._rate_limited_get")
+    def test_fetch_feed(self, mock_get):
+        mock_get.return_value = MagicMock(text="""<?xml version="1.0"?>
+        <rss><channel>
+            <item><title>Post 1</title><link>https://blog.com/1</link></item>
+        </channel></rss>""")
+        client = FeedsearchClient()
+        items = client.fetch_feed("https://blog.com/feed.xml")
+        assert len(items) == 1
+        assert items[0]["title"] == "Post 1"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Yahoo Finance
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestYFinanceClient:
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_search(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "quotes": [
+                {"symbol": "AAPL", "shortname": "Apple Inc.", "quoteType": "EQUITY",
+                 "exchange": "NMS"},
+            ]
+        })
+        client = YFinanceClient()
+        results = client.search("apple")
+        assert len(results) == 1
+        assert results[0]["symbol"] == "AAPL"
+        assert results[0]["name"] == "Apple Inc."
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_quote(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "chart": {"result": [{"meta": {
+                "symbol": "AAPL", "currency": "USD", "exchangeName": "NMS",
+                "regularMarketPrice": 195.50, "previousClose": 194.00,
+                "regularMarketTime": 1700000000,
+                "regularMarketDayHigh": 196.00, "regularMarketDayLow": 193.50,
+            }}]}
+        })
+        client = YFinanceClient()
+        result = client.quote("AAPL")
+        assert result["symbol"] == "AAPL"
+        assert result["price"] == 195.50
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_quote_not_found(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {"chart": {"result": []}})
+        client = YFinanceClient()
+        result = client.quote("INVALID")
+        assert "error" in result
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_news(self, mock_get):
+        mock_get.return_value = MagicMock(text="""<?xml version="1.0"?>
+        <rss><channel>
+            <item>
+                <title>Apple earnings beat</title>
+                <link>https://finance.yahoo.com/news/1</link>
+            </item>
+        </channel></rss>""")
+        client = YFinanceClient()
+        results = client.news("AAPL")
+        assert len(results) == 1
+        assert "Apple" in results[0]["title"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Alpha Vantage
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAlphaVantageClient:
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_search(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "bestMatches": [
+                {"1. symbol": "AAPL", "2. name": "Apple Inc.", "3. type": "Equity",
+                 "4. region": "United States", "8. currency": "USD"},
+            ]
+        })
+        client = AlphaVantageClient(api_key="test")
+        results = client.search("apple")
+        assert len(results) == 1
+        assert results[0]["symbol"] == "AAPL"
+        assert results[0]["name"] == "Apple Inc."
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_quote(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "Global Quote": {
+                "01. symbol": "AAPL", "02. open": "193.00", "03. high": "196.00",
+                "04. low": "192.50", "05. price": "195.50", "06. volume": "50000000",
+                "07. latest trading day": "2024-01-15", "08. previous close": "194.00",
+                "09. change": "1.50", "10. change percent": "0.77%",
+            }
+        })
+        client = AlphaVantageClient(api_key="test")
+        result = client.quote("AAPL")
+        assert result["symbol"] == "AAPL"
+        assert result["price"] == "195.50"
+        assert result["change_percent"] == "0.77%"
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_quote_not_found(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {"Global Quote": {}})
+        client = AlphaVantageClient(api_key="test")
+        result = client.quote("INVALID")
+        assert "error" in result
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_news_sentiment(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {
+            "feed": [
+                {"title": "Apple beats earnings", "url": "https://example.com/1",
+                 "source": "Reuters", "time_published": "20240115T120000",
+                 "summary": "Apple reported strong quarterly results.",
+                 "overall_sentiment_score": 0.35,
+                 "overall_sentiment_label": "Somewhat-Bullish",
+                 "ticker_sentiment": [
+                     {"ticker": "AAPL", "ticker_sentiment_score": "0.40",
+                      "ticker_sentiment_label": "Bullish", "relevance_score": "0.95"}
+                 ]},
+            ]
+        })
+        client = AlphaVantageClient(api_key="test")
+        results = client.news_sentiment(tickers="AAPL")
+        assert len(results) == 1
+        assert results[0]["overall_sentiment_score"] == 0.35
+        assert results[0]["ticker_sentiment"][0]["ticker"] == "AAPL"
+
+    @patch("agent.sources._finance._rate_limited_get")
+    def test_news_sentiment_empty(self, mock_get):
+        mock_get.return_value = MagicMock(json=lambda: {"feed": []})
+        client = AlphaVantageClient(api_key="test")
+        results = client.news_sentiment(topics="technology")
+        assert results == []

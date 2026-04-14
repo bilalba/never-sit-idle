@@ -1,9 +1,10 @@
 """CLI entrypoint for the knowledge-base agent.
 
 Designed for background operation:
-    - Daemon mode: runs continuously, exploring and building KB
+    - Daemon mode: runs continuously, pulling jobs from a file-based queue
     - Single-run modes: explore, research, query
-    - Status command: check agent progress
+    - Queue management: add jobs, list jobs
+    - Telegram bot: notifications + job intake when queue is empty
     - All output goes to log files
 """
 
@@ -19,8 +20,10 @@ import time
 from pathlib import Path
 
 from agent import config
+from agent import queue as Q
 from agent.agent import Agent
 from agent.prompts import EXPLORE_CODEBASE_PROMPT, RESEARCH_TOPIC_PROMPT, QUERY_KB_PROMPT
+from agent.telegram import TelegramBot
 
 
 LOG_DIR = Path(config.KNOWLEDGE_BASE_DIR) / ".logs"
@@ -82,6 +85,67 @@ def is_running() -> int | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Job execution helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _prompt_for_job(job: dict, task_dir: str) -> str:
+    """Build the LLM prompt for a given job."""
+    job_type = job["type"]
+    subject = job["subject"]
+
+    if job_type == Q.EXPLORE:
+        return EXPLORE_CODEBASE_PROMPT.format(task_dir=task_dir)
+    elif job_type == Q.RESEARCH:
+        return RESEARCH_TOPIC_PROMPT.format(topic=subject, task_dir=task_dir)
+    elif job_type == Q.QUERY:
+        return QUERY_KB_PROMPT.format(query=subject, task_dir=task_dir)
+    else:
+        return RESEARCH_TOPIC_PROMPT.format(topic=subject, task_dir=task_dir)
+
+
+def _run_job(agent: Agent, job: dict, logger: logging.Logger) -> None:
+    """Execute a single job: name task, run agent, update job status."""
+    job_id = job["id"]
+    job_type = job["type"]
+    subject = job["subject"]
+
+    Q.mark_running(job_id)
+
+    # Name the task
+    if job_type == Q.EXPLORE:
+        task_desc = f"Explore codebase at {agent.codebase_root}"
+    else:
+        task_desc = f"{job_type.title()}: {subject}"
+
+    try:
+        task_dir = agent.name_task(task_desc)
+    except Exception as exc:
+        logger.warning("Failed to name task, using fallback: %s", exc)
+        task_dir = f"task-{job_id}"
+        agent.task_dir = task_dir
+
+    # Set codebase root for explore jobs
+    if job_type == Q.EXPLORE and subject:
+        agent.codebase_root = Path(subject)
+
+    prompt = _prompt_for_job(job, task_dir)
+
+    logger.info("Running job %s: %s '%s' → %s/", job_id, job_type, subject[:80], task_dir)
+
+    try:
+        result = agent.run(prompt)
+        logger.info("Job %s complete. Result: %s", job_id, result[:200])
+        Q.mark_done(job_id, result_dir=task_dir)
+    except Exception as exc:
+        logger.exception("Job %s failed: %s", job_id, exc)
+        Q.mark_failed(job_id, error=str(exc))
+        raise
+
+    agent.reset_conversation()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Commands
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -90,7 +154,6 @@ def cmd_explore(args: argparse.Namespace) -> None:
     """Explore a codebase and build KB entries."""
     agent = _make_agent(args)
 
-    # Name the task
     task_desc = f"Explore codebase at {agent.codebase_root}"
     task_dir = agent.name_task(task_desc)
     print(f"Task directory: {task_dir}/")
@@ -112,7 +175,6 @@ def cmd_research(args: argparse.Namespace) -> None:
     agent = _make_agent(args)
     topic = args.topic
 
-    # Name the task
     task_dir = agent.name_task(f"Research: {topic}")
     print(f"Task directory: {task_dir}/")
 
@@ -131,7 +193,6 @@ def cmd_query(args: argparse.Namespace) -> None:
     agent = _make_agent(args)
     query = args.query
 
-    # Name the task
     task_dir = agent.name_task(f"Query: {query}")
     print(f"Task directory: {task_dir}/")
 
@@ -145,7 +206,12 @@ def cmd_query(args: argparse.Namespace) -> None:
 
 
 def cmd_daemon(args: argparse.Namespace) -> None:
-    """Run continuously in the background, building knowledge."""
+    """Run continuously, pulling jobs from the queue.
+
+    When the queue is empty:
+      - If Telegram is configured, asks the user for work and waits for a reply
+      - Otherwise, sleeps for --idle-timeout seconds then checks again
+    """
     if is_running():
         print(f"Agent already running (PID {is_running()}). Use 'stop' to stop it.")
         sys.exit(1)
@@ -154,7 +220,7 @@ def cmd_daemon(args: argparse.Namespace) -> None:
     setup_logging(verbose=args.verbose)
     logger = logging.getLogger("agent.daemon")
 
-    # Handle graceful shutdown
+    # Graceful shutdown
     shutdown = False
 
     def _handle_signal(signum, frame):
@@ -166,59 +232,245 @@ def cmd_daemon(args: argparse.Namespace) -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     agent = _make_agent(args)
-    interval = args.interval or 300  # Default 5 minutes between runs
-    tasks = _build_daemon_tasks(args)
+    bot = TelegramBot()
+    idle_timeout = args.idle_timeout
+    jobs_completed = 0
 
-    logger.info("Daemon started (PID %d), interval=%ds, tasks=%d", os.getpid(), interval, len(tasks))
-    write_status({"mode": "daemon", "state": "running", "pid": os.getpid(), "interval": interval})
+    # Seed the queue with any --topics passed on the command line
+    topics = getattr(args, "topics", None) or []
+    for topic in topics:
+        Q.add(Q.RESEARCH, topic)
+        logger.info("Seeded queue with topic: %s", topic)
 
-    task_idx = 0
+    logger.info(
+        "Daemon started (PID %d), idle_timeout=%ds, telegram=%s, queued=%d",
+        os.getpid(), idle_timeout, bot.enabled, Q.queue_size(),
+    )
+    if bot.enabled:
+        bot.send("\u25b6\ufe0f *Agent started.* Watching queue for jobs.")
+
+    write_status({"mode": "daemon", "state": "running", "pid": os.getpid()})
+
     while not shutdown:
-        task_desc, task_prompt_tmpl = tasks[task_idx % len(tasks)]
-        task_idx += 1
+        job = Q.next_job()
 
-        # Name each task so it gets its own directory
-        try:
-            task_dir = agent.name_task(task_desc)
-        except Exception as exc:
-            logger.warning("Failed to name task, using fallback: %s", exc)
-            task_dir = f"task-{task_idx}"
-            agent.task_dir = task_dir
+        if job:
+            # ── Run the next job ──────────────────────────────────
+            write_status({
+                "mode": "daemon", "state": "running_job",
+                "job_id": job["id"], "job_type": job["type"],
+                "subject": job["subject"][:200],
+                "pid": os.getpid(),
+            })
+            bot.notify_job_started(job)
 
-        task_prompt = task_prompt_tmpl.format(task_dir=task_dir, topic=task_desc)
+            try:
+                _run_job(agent, job, logger)
+                jobs_completed += 1
+                # Re-read the job to get updated fields
+                done_job = Q.list_jobs()
+                done_job = next((j for j in done_job if j["id"] == job["id"]), job)
+                bot.notify_job_done(done_job)
+            except Exception:
+                failed_job = Q.list_jobs()
+                failed_job = next((j for j in failed_job if j["id"] == job["id"]), job)
+                bot.notify_job_failed(failed_job)
 
-        logger.info("Running task '%s' in %s/", task_desc[:100], task_dir)
-        write_status({
-            "mode": "daemon", "state": "running_task",
-            "task": task_desc[:200], "task_dir": task_dir,
-            "task_num": task_idx, "pid": os.getpid(),
-        })
+            write_status({
+                "mode": "daemon", "state": "idle",
+                "jobs_completed": jobs_completed,
+                "jobs_queued": Q.queue_size(),
+                "pid": os.getpid(),
+                **agent.stats(),
+            })
+            continue  # immediately check for next job
 
-        try:
-            result = agent.run(task_prompt)
-            logger.info("Task complete. Result: %s", result[:200])
-        except Exception as exc:
-            logger.exception("Task failed: %s", exc)
+        # ── Queue is empty ────────────────────────────────────────
+        if bot.enabled:
+            logger.info("Queue empty — asking Telegram for work")
+            bot.notify_idle(completed_count=jobs_completed)
 
-        # Reset conversation between tasks to keep context fresh
-        agent.reset_conversation()
+            write_status({
+                "mode": "daemon", "state": "waiting_for_input",
+                "jobs_completed": jobs_completed,
+                "pid": os.getpid(),
+            })
 
-        write_status({
-            "mode": "daemon", "state": "sleeping",
-            "next_run_at": time.time() + interval,
-            "pid": os.getpid(),
-            **agent.stats(),
-        })
+            # Long-poll Telegram for a reply
+            reply = None
+            while not shutdown and reply is None:
+                reply = bot.poll_reply(timeout=30)
 
-        # Sleep with shutdown check
-        for _ in range(interval):
             if shutdown:
                 break
-            time.sleep(1)
 
-    logger.info("Daemon stopped")
-    write_status({"mode": "daemon", "state": "stopped", **agent.stats()})
+            if reply:
+                logger.info("Received from Telegram: %s", reply[:200])
+                # Treat the reply as a research topic
+                new_job = Q.add(Q.RESEARCH, reply)
+                bot.send(f"\U0001f4cb Queued: *{reply}*")
+                logger.info("Queued job %s from Telegram", new_job["id"])
+                continue
+
+        else:
+            # No Telegram — just sleep and re-check
+            logger.info("Queue empty, sleeping %ds...", idle_timeout)
+            write_status({
+                "mode": "daemon", "state": "idle_sleeping",
+                "jobs_completed": jobs_completed,
+                "jobs_queued": 0,
+                "next_check_at": time.time() + idle_timeout,
+                "pid": os.getpid(),
+            })
+            for _ in range(idle_timeout):
+                if shutdown:
+                    break
+                # Wake up early if a job appears
+                if Q.queue_size() > 0:
+                    break
+                time.sleep(1)
+
+    # ── Shutdown ──────────────────────────────────────────────────────
+    logger.info("Daemon stopped. Jobs completed: %d", jobs_completed)
+    bot.notify_shutdown({"jobs_completed": jobs_completed, "jobs_queued": Q.queue_size()})
+    write_status({"mode": "daemon", "state": "stopped", "jobs_completed": jobs_completed, **agent.stats()})
     clear_pid()
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    """Add a job to the queue."""
+    job = Q.add(args.job_type, args.subject)
+    print(f"Queued: [{job['type']}] {job['subject']}")
+    print(f"Job ID: {job['id']}")
+    pending = Q.queue_size()
+    print(f"Queue: {pending} job{'s' if pending != 1 else ''} pending")
+
+
+def cmd_jobs(args: argparse.Namespace) -> None:
+    """List jobs in the queue."""
+    status_filter = getattr(args, "filter", None)
+    jobs = Q.list_jobs(status=status_filter)
+
+    if not jobs:
+        print("No jobs." if not status_filter else f"No {status_filter} jobs.")
+        return
+
+    for job in jobs:
+        status = job["status"].upper()
+        subject = job["subject"]
+        if len(subject) > 60:
+            subject = subject[:57] + "..."
+
+        # Format timing
+        timing = ""
+        if job["status"] == Q.RUNNING and job.get("started_at"):
+            elapsed = int(time.time() - job["started_at"])
+            timing = f" ({elapsed}s ago)"
+        elif job["status"] in (Q.DONE, Q.FAILED) and job.get("started_at") and job.get("completed_at"):
+            duration = int(job["completed_at"] - job["started_at"])
+            timing = f" ({duration}s)"
+
+        result_dir = f" → {job['result_dir']}/" if job.get("result_dir") else ""
+        error = f" !! {job['error'][:60]}" if job.get("error") else ""
+
+        print(f"  [{status:7s}] {job['type']:8s}  {subject}{timing}{result_dir}{error}")
+
+
+def cmd_clear(args: argparse.Namespace) -> None:
+    """Clear completed/failed jobs from the queue."""
+    removed = Q.clear_done()
+    print(f"Removed {removed} completed/failed job{'s' if removed != 1 else ''}.")
+
+
+def cmd_setup_telegram(args: argparse.Namespace) -> None:
+    """Interactive setup for the Telegram bot integration."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+
+    print("=== Telegram Bot Setup ===\n")
+    print("Step 1: Create a bot")
+    print("  1. Open Telegram and message @BotFather")
+    print("  2. Send /newbot and follow the prompts")
+    print("  3. Copy the bot token (looks like 123456:ABC-DEF...)\n")
+
+    token = input("Paste your bot token: ").strip()
+    if not token:
+        print("No token provided, aborting.")
+        return
+
+    # Verify the token works
+    import requests
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"Invalid token: {data.get('description', 'unknown error')}")
+            return
+        bot_name = data["result"].get("username", "unknown")
+        print(f"  Bot verified: @{bot_name}\n")
+    except requests.RequestException as exc:
+        print(f"Could not verify token: {exc}")
+        return
+
+    print("Step 2: Get your chat ID")
+    print(f"  1. Open Telegram and message @{bot_name}")
+    print("  2. Send any message (e.g., 'hello')")
+    input("  Press Enter once you've sent the message...")
+
+    # Fetch updates to find the chat ID
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates", timeout=10)
+        data = resp.json()
+        updates = data.get("result", [])
+    except requests.RequestException as exc:
+        print(f"Could not fetch updates: {exc}")
+        return
+
+    chat_id = None
+    for update in reversed(updates):  # most recent first
+        msg = update.get("message", {})
+        chat = msg.get("chat", {})
+        if chat.get("id"):
+            chat_id = str(chat["id"])
+            chat_name = chat.get("first_name") or chat.get("title") or chat_id
+            print(f"  Found chat: {chat_name} (ID: {chat_id})\n")
+            break
+
+    if not chat_id:
+        print("  No messages found. Make sure you sent a message to the bot.")
+        print("  You can set TELEGRAM_CHAT_ID manually in .env")
+        chat_id = input("  Or enter your chat ID manually: ").strip()
+        if not chat_id:
+            print("No chat ID, aborting.")
+            return
+
+    # Send a test message
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": "\u2705 Bot connected! I'll notify you here when I need work."},
+            timeout=10,
+        )
+        if resp.json().get("ok"):
+            print("  Test message sent! Check your Telegram.\n")
+        else:
+            print(f"  Warning: test message failed: {resp.json().get('description')}\n")
+    except requests.RequestException:
+        pass
+
+    # Write to .env
+    env_lines = []
+    if env_path.exists():
+        env_lines = env_path.read_text().splitlines()
+
+    # Remove existing telegram lines
+    env_lines = [l for l in env_lines if not l.strip().startswith(("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"))]
+
+    env_lines.append(f"TELEGRAM_BOT_TOKEN={token}")
+    env_lines.append(f"TELEGRAM_CHAT_ID={chat_id}")
+
+    env_path.write_text("\n".join(env_lines) + "\n")
+    print(f"Saved to {env_path}")
+    print("The daemon will now use Telegram for notifications and job intake.")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
@@ -229,7 +481,6 @@ def cmd_stop(args: argparse.Namespace) -> None:
         return
     os.kill(pid, signal.SIGTERM)
     print(f"Sent SIGTERM to agent (PID {pid})")
-    # Wait for it to exit
     for _ in range(10):
         if not is_running():
             print("Agent stopped.")
@@ -252,11 +503,16 @@ def cmd_status(args: argparse.Namespace) -> None:
     else:
         print("No status file found.")
 
-    # Show KB stats
+    # Queue stats
+    queued = Q.queue_size()
+    total = len(Q.list_jobs())
+    print(f"\nQueue: {queued} pending, {total} total")
+
+    # KB stats
     from agent.knowledge_base import KnowledgeBase
     kb = KnowledgeBase()
     stats = kb.stats()
-    print(f"\nKnowledge base: {stats['entry_count']} entries, {stats['total_tokens']} tokens")
+    print(f"Knowledge base: {stats['entry_count']} entries, {stats['total_tokens']} tokens")
     if stats['categories']:
         print(f"Categories: {', '.join(stats['categories'])}")
 
@@ -280,28 +536,6 @@ def _make_agent(args: argparse.Namespace) -> Agent:
         kb_dir=getattr(args, "kb_dir", None),
         max_turns=getattr(args, "max_turns", None),
     )
-
-
-def _build_daemon_tasks(args: argparse.Namespace) -> list[tuple[str, str]]:
-    """Build the rotation of tasks for daemon mode.
-
-    Returns list of (description, prompt_template) tuples.
-    Prompt templates may contain {task_dir} and {topic} placeholders.
-    """
-    tasks: list[tuple[str, str]] = []
-
-    # Always explore codebase
-    tasks.append(("Explore codebase", EXPLORE_CODEBASE_PROMPT))
-
-    # User-specified topics
-    topics = getattr(args, "topics", None) or []
-    for topic in topics:
-        tasks.append((topic, RESEARCH_TOPIC_PROMPT))
-
-    if not tasks:
-        tasks.append(("Explore codebase", EXPLORE_CODEBASE_PROMPT))
-
-    return tasks
 
 
 def _print_event(event: dict) -> None:
@@ -360,13 +594,36 @@ def main() -> None:
     p_query.set_defaults(func=cmd_query)
 
     # daemon
-    p_daemon = sub.add_parser("daemon", help="Run continuously in background")
+    p_daemon = sub.add_parser("daemon", help="Run continuously, processing queued jobs")
     p_daemon.add_argument("--codebase", type=str)
     p_daemon.add_argument("--kb-dir", type=str)
-    p_daemon.add_argument("--interval", type=int, default=300, help="Seconds between tasks (default 300)")
+    p_daemon.add_argument("--idle-timeout", type=int, default=60,
+                          help="Seconds to wait when queue is empty before re-checking (default 60)")
     p_daemon.add_argument("--max-turns", type=int, default=30)
-    p_daemon.add_argument("--topics", nargs="*", help="Topics to research in rotation")
+    p_daemon.add_argument("--topics", nargs="*", help="Seed the queue with these research topics")
     p_daemon.set_defaults(func=cmd_daemon)
+
+    # add (queue a job)
+    p_add = sub.add_parser("add", help="Queue a job for the daemon")
+    p_add.add_argument("job_type", choices=sorted(Q.VALID_TYPES),
+                       help="Job type: explore, research, or query")
+    p_add.add_argument("subject", type=str,
+                       help="Topic to research, path to explore, or question to query")
+    p_add.set_defaults(func=cmd_add)
+
+    # jobs (list queue)
+    p_jobs = sub.add_parser("jobs", help="List queued/running/completed jobs")
+    p_jobs.add_argument("--filter", choices=[Q.QUEUED, Q.RUNNING, Q.DONE, Q.FAILED],
+                        help="Filter by status")
+    p_jobs.set_defaults(func=cmd_jobs)
+
+    # clear (remove done/failed jobs)
+    p_clear = sub.add_parser("clear", help="Remove completed/failed jobs from queue")
+    p_clear.set_defaults(func=cmd_clear)
+
+    # setup-telegram
+    p_telegram = sub.add_parser("setup-telegram", help="Interactive Telegram bot setup")
+    p_telegram.set_defaults(func=cmd_setup_telegram)
 
     # stop
     p_stop = sub.add_parser("stop", help="Stop running daemon")

@@ -3,13 +3,16 @@
 Uses the Bot API directly via requests — no extra dependencies.
 The bot can:
   - Send notifications (job done, queue empty, shutting down)
-  - Long-poll for user replies to queue new jobs
+  - Long-poll for user messages, batch-draining all pending
+  - Handle commands: /jobs, /status, /help, /queue, /cancel
+  - Queue plain-text messages as research topics with confirmation
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import requests
@@ -19,6 +22,16 @@ from agent import config
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+
+@dataclass
+class IncomingMessage:
+    """A parsed message from Telegram."""
+    text: str
+    message_id: int
+    is_command: bool
+    command: str  # e.g. "jobs", "status" — empty if not a command
+    args: str     # everything after the command
 
 
 class TelegramBot:
@@ -56,14 +69,25 @@ class TelegramBot:
 
     # ── Sending ───────────────────────────────────────────────────────
 
-    def send(self, text: str, parse_mode: str = "Markdown") -> dict[str, Any] | None:
+    def send(
+        self,
+        text: str,
+        parse_mode: str = "Markdown",
+        reply_to: int | None = None,
+    ) -> dict[str, Any] | None:
         """Send a message to the configured chat."""
-        return self._call(
-            "sendMessage",
-            chat_id=self.chat_id,
-            text=text,
-            parse_mode=parse_mode,
-        )
+        params: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+        if reply_to:
+            params["reply_to_message_id"] = reply_to
+        return self._call("sendMessage", **params)
+
+    def reply(self, msg: IncomingMessage, text: str) -> dict[str, Any] | None:
+        """Reply to a specific incoming message."""
+        return self.send(text, reply_to=msg.message_id)
 
     def notify_idle(self, completed_count: int = 0) -> None:
         """Tell the user the queue is empty and ask for work."""
@@ -71,8 +95,8 @@ class TelegramBot:
         if completed_count:
             msg += f" Completed {completed_count} job{'s' if completed_count != 1 else ''}."
         msg += (
-            "\n\nWhat should I research next? "
-            "Reply with a topic and I'll queue it up."
+            "\n\nSend me topics to research, or use commands:"
+            "\n/help — show all commands"
         )
         self.send(msg)
 
@@ -106,12 +130,28 @@ class TelegramBot:
 
     # ── Receiving ─────────────────────────────────────────────────────
 
-    def poll_reply(self, timeout: int = 30) -> str | None:
-        """Long-poll for a single text reply from the user.
+    def _parse_message(self, text: str, message_id: int) -> IncomingMessage:
+        """Parse raw text into an IncomingMessage."""
+        text = text.strip()
+        if text.startswith("/"):
+            parts = text.split(None, 1)
+            # Strip @botname from command (e.g. /jobs@mybot -> jobs)
+            cmd = parts[0][1:].split("@")[0].lower()
+            args = parts[1] if len(parts) > 1 else ""
+            return IncomingMessage(
+                text=text, message_id=message_id,
+                is_command=True, command=cmd, args=args,
+            )
+        return IncomingMessage(
+            text=text, message_id=message_id,
+            is_command=False, command="", args="",
+        )
 
-        Returns the message text, or None if no message arrives
-        within the timeout window. Only returns messages from the
-        configured chat_id.
+    def poll_messages(self, timeout: int = 30) -> list[IncomingMessage]:
+        """Long-poll and return ALL pending messages from our chat.
+
+        Returns a list of IncomingMessage (may be empty).
+        Advances the offset past all returned updates.
         """
         result = self._call(
             "getUpdates",
@@ -120,8 +160,9 @@ class TelegramBot:
             allowed_updates=["message"],
         )
         if not result:
-            return None
+            return []
 
+        messages: list[IncomingMessage] = []
         for update in result:
             update_id = update.get("update_id", 0)
             self._update_offset = max(self._update_offset, update_id + 1)
@@ -129,29 +170,140 @@ class TelegramBot:
             msg = update.get("message", {})
             chat = msg.get("chat", {})
             text = msg.get("text", "")
+            message_id = msg.get("message_id", 0)
 
             # Only accept messages from our chat
             if str(chat.get("id")) == str(self.chat_id) and text.strip():
-                return text.strip()
+                messages.append(self._parse_message(text, message_id))
 
+        return messages
+
+    # Keep poll_reply for backwards compat / simple cases
+    def poll_reply(self, timeout: int = 30) -> str | None:
+        """Long-poll for a single text reply. Returns text or None."""
+        msgs = self.poll_messages(timeout=timeout)
+        for m in msgs:
+            if not m.is_command:
+                return m.text
         return None
 
-    def wait_for_reply(self, timeout: int = 30, max_wait: int = 0) -> str | None:
-        """Poll for a reply, optionally up to max_wait seconds total.
+    # ── Command handlers ──────────────────────────────────────────────
 
-        If max_wait is 0, polls once (with long-poll timeout).
-        If max_wait > 0, keeps polling until a reply or max_wait elapsed.
-        Returns the reply text or None.
+    def handle_commands(
+        self,
+        messages: list[IncomingMessage],
+        queue_module: Any,
+        agent_stats: dict[str, Any] | None = None,
+    ) -> list[IncomingMessage]:
+        """Process command messages, reply inline, return non-command messages.
+
+        Takes the full batch from poll_messages(). Commands are handled
+        and replied to immediately. Plain-text messages (topics to queue)
+        are returned for the caller to process.
         """
-        if max_wait <= 0:
-            return self.poll_reply(timeout=timeout)
+        topics: list[IncomingMessage] = []
 
-        deadline = time.time() + max_wait
-        while time.time() < deadline:
-            remaining = int(deadline - time.time())
-            poll_timeout = min(timeout, max(1, remaining))
-            reply = self.poll_reply(timeout=poll_timeout)
-            if reply:
-                return reply
+        for msg in messages:
+            if not msg.is_command:
+                topics.append(msg)
+                continue
 
-        return None
+            handler = {
+                "help": self._cmd_help,
+                "start": self._cmd_help,
+                "jobs": lambda m: self._cmd_jobs(m, queue_module),
+                "status": lambda m: self._cmd_status(m, queue_module, agent_stats),
+                "queue": lambda m: self._cmd_queue(m, queue_module),
+                "cancel": lambda m: self._cmd_cancel(m, queue_module),
+                "clear": lambda m: self._cmd_clear(m, queue_module),
+            }.get(msg.command)
+
+            if handler:
+                handler(msg)
+            else:
+                self.reply(msg, f"Unknown command: /{msg.command}\nSend /help for available commands.")
+
+        return topics
+
+    def _cmd_help(self, msg: IncomingMessage) -> None:
+        self.reply(msg, (
+            "*Commands:*\n"
+            "/jobs — list recent jobs\n"
+            "/status — daemon & KB status\n"
+            "/queue `topic` — queue a research job\n"
+            "/cancel `job-id` — cancel a queued job\n"
+            "/clear — remove done/failed jobs\n"
+            "/help — this message\n"
+            "\nOr just send a topic and I'll queue it as research."
+        ))
+
+    def _cmd_jobs(self, msg: IncomingMessage, Q: Any) -> None:
+        jobs = Q.list_jobs()
+        if not jobs:
+            self.reply(msg, "No jobs.")
+            return
+
+        lines = []
+        status_emoji = {
+            "queued": "\U0001f552",   # clock
+            "running": "\u2699\ufe0f", # gear
+            "done": "\u2705",          # check
+            "failed": "\u274c",        # cross
+        }
+        for j in jobs[:15]:  # cap at 15 to avoid message length limits
+            emoji = status_emoji.get(j["status"], "\u2753")
+            subject = j["subject"]
+            if len(subject) > 45:
+                subject = subject[:42] + "..."
+            lines.append(f"{emoji} `{j['status']:7s}` {subject}")
+
+        total = len(jobs)
+        text = "\n".join(lines)
+        if total > 15:
+            text += f"\n\n_...and {total - 15} more_"
+        self.reply(msg, text)
+
+    def _cmd_status(
+        self, msg: IncomingMessage, Q: Any,
+        agent_stats: dict[str, Any] | None,
+    ) -> None:
+        queued = Q.queue_size()
+        total = len(Q.list_jobs())
+        lines = [
+            f"*Queue:* {queued} pending, {total} total",
+        ]
+        if agent_stats:
+            lines.append(f"*Turns:* {agent_stats.get('total_turns', 0)}")
+            lines.append(f"*Tool calls:* {agent_stats.get('total_tool_calls', 0)}")
+            kb = agent_stats.get("kb_stats", {})
+            if kb:
+                lines.append(f"*KB:* {kb.get('entry_count', 0)} entries, {kb.get('total_tokens', 0)} tokens")
+        self.reply(msg, "\n".join(lines))
+
+    def _cmd_queue(self, msg: IncomingMessage, Q: Any) -> None:
+        topic = msg.args.strip()
+        if not topic:
+            self.reply(msg, "Usage: /queue `topic to research`")
+            return
+        job = Q.add("research", topic)
+        self.reply(msg, f"\U0001f4cb Queued: *{topic}*\n`{job['id']}`")
+
+    def _cmd_cancel(self, msg: IncomingMessage, Q: Any) -> None:
+        job_id = msg.args.strip()
+        if not job_id:
+            self.reply(msg, "Usage: /cancel `job-id`")
+            return
+        # Find matching job(s) — allow prefix match
+        jobs = Q.list_jobs(status="queued")
+        match = [j for j in jobs if j["id"] == job_id or j["id"].startswith(job_id)]
+        if not match:
+            self.reply(msg, f"No queued job matching `{job_id}`")
+            return
+        for j in match:
+            Q.mark_failed(j["id"], error="Cancelled via Telegram")
+        names = ", ".join(j["subject"] for j in match)
+        self.reply(msg, f"\U0001f6ab Cancelled: {names}")
+
+    def _cmd_clear(self, msg: IncomingMessage, Q: Any) -> None:
+        removed = Q.clear_done()
+        self.reply(msg, f"Removed {removed} completed/failed job{'s' if removed != 1 else ''}.")

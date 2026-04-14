@@ -276,6 +276,16 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 failed_job = next((j for j in failed_job if j["id"] == job["id"]), job)
                 bot.notify_job_failed(failed_job)
 
+            # Drain any Telegram messages that arrived while the job ran
+            if bot.enabled:
+                pending = bot.poll_messages(timeout=0)
+                if pending:
+                    topics = bot.handle_commands(pending, Q, agent_stats=agent.stats())
+                    for msg in topics:
+                        new_job = Q.add(Q.RESEARCH, msg.text)
+                        bot.reply(msg, f"\U0001f4cb Queued: *{msg.text}*")
+                        logger.info("Queued job %s from Telegram (between jobs): %s", new_job["id"], msg.text[:100])
+
             write_status({
                 "mode": "daemon", "state": "idle",
                 "jobs_completed": jobs_completed,
@@ -296,21 +306,34 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 "pid": os.getpid(),
             })
 
-            # Long-poll Telegram for a reply
-            reply = None
-            while not shutdown and reply is None:
-                reply = bot.poll_reply(timeout=30)
+            # Long-poll Telegram until we get at least one topic
+            while not shutdown:
+                messages = bot.poll_messages(timeout=30)
+                if not messages:
+                    continue
+
+                # Handle commands inline, get back plain-text topics
+                topics = bot.handle_commands(messages, Q, agent_stats=agent.stats())
+
+                # Queue each topic with a reply confirmation
+                for msg in topics:
+                    new_job = Q.add(Q.RESEARCH, msg.text)
+                    bot.reply(msg, f"\U0001f4cb Queued: *{msg.text}*")
+                    logger.info("Queued job %s from Telegram: %s", new_job["id"], msg.text[:100])
+
+                # If we queued any topics, break out to process them
+                if topics:
+                    break
+
+                # If it was only commands, keep polling
+                # (also re-check the queue in case /queue added something)
+                if Q.queue_size() > 0:
+                    break
 
             if shutdown:
                 break
 
-            if reply:
-                logger.info("Received from Telegram: %s", reply[:200])
-                # Treat the reply as a research topic
-                new_job = Q.add(Q.RESEARCH, reply)
-                bot.send(f"\U0001f4cb Queued: *{reply}*")
-                logger.info("Queued job %s from Telegram", new_job["id"])
-                continue
+            continue
 
         else:
             # No Telegram — just sleep and re-check

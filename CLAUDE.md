@@ -32,7 +32,7 @@ agent/
   prompts.py        — System prompts for explore/research/query modes
   agent.py          — Core loop: build messages → LLM call → parse tool calls → execute → repeat
   cli.py            — CLI with daemon mode, job queue, PID tracking, log files, graceful shutdown
-tests/              — 197 tests covering all modules
+tests/              — 215 tests covering all modules
 ```
 
 ## Key design decisions
@@ -41,7 +41,7 @@ tests/              — 197 tests covering all modules
 - **Rate limiting**: All HTTP sources go through a centralized `RateLimiter` in `sources/_base.py` that tracks both window-based (requests in last 60s) and header-based (`x-ratelimit-remaining`) limits. Reddit is capped at 30/min.
 - **Memory budget**: LTM has a hard 50k token cap measured via tiktoken `cl100k_base`. Writes that would exceed the budget are rejected with ValueError.
 - **Job queue**: File-based queue in `kb/.queue/jobs/`. Each job is a JSON file with status transitions: queued → running → done/failed. The daemon polls for queued jobs; CLI `add` command writes new job files. No IPC — filesystem is the coordination layer.
-- **Telegram bot**: When the queue drains, the daemon messages the user asking what to research next and long-polls for a reply. Also notifies on job start/done/fail/shutdown. Degrades gracefully — if no token configured, the daemon just sleeps and re-checks the queue.
+- **Telegram bot**: Batch-drains all pending messages each poll cycle. Plain text → queued as research with reply confirmation. Commands (`/jobs`, `/status`, `/queue`, `/cancel`, `/clear`, `/help`) are handled inline. Between jobs, drains any messages that arrived while running. When idle, long-polls Telegram for input. Degrades gracefully — if no token configured, the daemon just sleeps and re-checks the queue.
 - **Background-first**: The daemon runs in the foreground (no forking — Python antipattern). Use tmux/nohup/systemd to background it. Logs to files, writes PID/status files, handles SIGTERM gracefully.
 - **No React/Ink CLI**: Deliberately kept as plain Python since the agent primarily runs unattended in background.
 
@@ -81,7 +81,7 @@ python run.py tree
 python -m pytest tests/ -v
 ```
 
-All 197 tests pass. Tests use mocks for HTTP/LLM calls — no live API calls in tests.
+All 215 tests pass. Tests use mocks for HTTP/LLM calls — no live API calls in tests.
 
 ## Known issues / next steps
 

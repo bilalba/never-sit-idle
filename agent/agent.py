@@ -14,6 +14,7 @@ from agent.llm import (
     LLMError,
     LLMRetryExhausted,
     chat_completion,
+    chat_completion_stream,
     count_messages_tokens,
     extract_assistant_message,
     extract_tool_calls,
@@ -125,17 +126,15 @@ class Agent:
                 ),
             })
 
-        # 4. Task directory context
+        # 4. Task directory hint (optional — does NOT restrict writes)
         if self.task_dir:
             msgs.append({
                 "role": "system",
                 "content": (
-                    "# Current Task Directory\n\n"
-                    f"All knowledge base entries for this task MUST be written under "
-                    f"the `{self.task_dir}/` directory prefix. For example, use "
-                    f"`kb_write(\"{self.task_dir}/overview\", ...)` not `kb_write(\"overview\", ...)`.\n\n"
-                    "You MUST also persist key findings and cross-session facts using "
-                    "`memory_store` so they survive across sessions."
+                    "# Current Task Context\n\n"
+                    f"This task is associated with `{self.task_dir}/`. You may use this "
+                    f"as a starting point, but you are free to write entries anywhere in "
+                    f"the KB — organize logically and enrich existing entries when relevant."
                 ),
             })
 
@@ -146,10 +145,11 @@ class Agent:
 
     # ── Single turn ────────────────────────────────────────────────────
 
-    def _execute_turn(self) -> dict[str, Any]:
+    def _execute_turn(self, on_text_delta: Any | None = None) -> dict[str, Any]:
         """Execute one LLM call + tool execution cycle.
 
         Returns the assistant message dict.
+        If on_text_delta is provided, streams text via chat_completion_stream.
         """
         messages = self._build_messages()
         tools = self.registry.get_schemas()
@@ -158,7 +158,12 @@ class Agent:
         self.total_input_tokens += count_messages_tokens(messages)
 
         # LLM call (retries handled internally)
-        response = chat_completion(messages, tools)
+        if on_text_delta:
+            response = chat_completion_stream(
+                messages, tools, on_delta=on_text_delta
+            )
+        else:
+            response = chat_completion(messages, tools)
 
         # Extract usage stats
         usage = response.get("usage", {})
@@ -197,10 +202,15 @@ class Agent:
 
     # ── Main run loop ──────────────────────────────────────────────────
 
-    def run(self, user_message: str) -> str:
+    def run(
+        self,
+        user_message: str,
+        on_text_delta: Any | None = None,
+    ) -> str:
         """Run the agent on a user message until completion.
 
         Returns the final assistant text response.
+        If on_text_delta is provided, streams text chunks via the callback.
         """
         # Add user message
         self.messages.append({"role": "user", "content": user_message})
@@ -212,7 +222,7 @@ class Agent:
             logger.info("=== Turn %d ===", self.total_turns)
 
             try:
-                assistant_msg = self._execute_turn()
+                assistant_msg = self._execute_turn(on_text_delta=on_text_delta)
             except LLMRetryExhausted as exc:
                 error_text = f"[Agent error: LLM call failed after {exc.attempts} retries: {exc.last_error}]"
                 logger.error(error_text)

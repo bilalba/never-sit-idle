@@ -442,15 +442,20 @@ class TestHandleTelegramMessage:
         agent.system_prompt = MagicMock()
 
         bot = MagicMock()
+        bot.send.return_value = None
         msg = IncomingMessage("what do we know about React hooks?", 10, False, "", "")
         logger = logging.getLogger("test")
 
         _handle_telegram_message(agent, bot, msg, logger)
 
-        agent.run.assert_called_once_with("what do we know about React hooks?")
-        bot.send_long.assert_called_once_with(
-            "Here's what I know about React hooks...", reply_to=10,
-        )
+        # Agent called with message text and streaming callback
+        agent.run.assert_called_once()
+        assert agent.run.call_args.args[0] == "what do we know about React hooks?"
+        assert agent.run.call_args.kwargs.get("on_text_delta") is not None
+        # Typing indicator sent
+        bot.send_typing.assert_called_once()
+        # Final response sent (via streamer)
+        bot.send.assert_called()
         # Should have set the Telegram system prompt
         assert agent.system_prompt.text == TELEGRAM_CHAT_SYSTEM
 
@@ -462,14 +467,16 @@ class TestHandleTelegramMessage:
         agent.system_prompt = MagicMock()
 
         bot = MagicMock()
+        bot.send.return_value = None
         msg = IncomingMessage("test", 11, False, "", "")
         logger = logging.getLogger("test")
 
         _handle_telegram_message(agent, bot, msg, logger)
 
-        bot.reply.assert_called_once()
-        reply_text = bot.reply.call_args.args[1]
-        assert "something went wrong" in reply_text
+        # Error sent via streamer (bot.send with error text)
+        bot.send.assert_called()
+        send_text = bot.send.call_args.args[0]
+        assert "something went wrong" in send_text
 
     def test_handles_empty_response(self):
         from agent.cli import _handle_telegram_message
@@ -479,14 +486,16 @@ class TestHandleTelegramMessage:
         agent.system_prompt = MagicMock()
 
         bot = MagicMock()
+        bot.send.return_value = None
         msg = IncomingMessage("test", 12, False, "", "")
         logger = logging.getLogger("test")
 
         _handle_telegram_message(agent, bot, msg, logger)
 
-        bot.reply.assert_called_once()
-        reply_text = bot.reply.call_args.args[1]
-        assert "No response" in reply_text
+        # "(No response)" sent via streamer
+        bot.send.assert_called()
+        send_text = bot.send.call_args.args[0]
+        assert "No response" in send_text
 
     def test_does_not_reset_conversation(self):
         """Telegram messages should keep conversation context."""
@@ -497,9 +506,152 @@ class TestHandleTelegramMessage:
         agent.system_prompt = MagicMock()
 
         bot = MagicMock()
+        bot.send.return_value = None
         msg = IncomingMessage("test", 13, False, "", "")
         logger = logging.getLogger("test")
 
         _handle_telegram_message(agent, bot, msg, logger)
 
         agent.reset_conversation.assert_not_called()
+
+
+class TestTelegramMemory:
+    """Tests for TelegramMemory conversation context management."""
+
+    def test_add_and_get_context(self, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        mem.add_exchange("hello", "hi there")
+        mem.add_exchange("what is 2+2?", "4")
+
+        msgs = mem.get_context_messages()
+        assert len(msgs) == 4  # 2 user + 2 assistant
+        assert msgs[0] == {"role": "user", "content": "hello"}
+        assert msgs[1] == {"role": "assistant", "content": "hi there"}
+
+    def test_persistence(self, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        path = tmp_path / "mem.json"
+        mem1 = TelegramMemory(persist_path=path)
+        mem1.add_exchange("q1", "a1")
+        mem1.add_exchange("q2", "a2")
+
+        # Load from same path
+        mem2 = TelegramMemory(persist_path=path)
+        assert len(mem2.exchanges) == 2
+        assert mem2.exchanges[0]["user"] == "q1"
+
+    def test_needs_compaction(self, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        for i in range(3):
+            mem.add_exchange(f"q{i}", f"a{i}")
+        assert not mem.needs_compaction()  # 3 <= RECENT_LIMIT (4)
+
+        mem.add_exchange("q3", "a3")
+        mem.add_exchange("q4", "a4")
+        assert mem.needs_compaction()  # 5 > 4
+
+    @patch("agent.telegram_memory.chat_completion")
+    @patch("agent.telegram_memory.extract_assistant_message")
+    def test_compact_summarizes_older(self, mock_extract, mock_chat, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mock_extract.return_value = {"content": "Summary: user asked several questions."}
+        mock_chat.return_value = {}
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        for i in range(6):
+            mem.add_exchange(f"question {i}", f"answer {i}")
+
+        mem.compact()
+
+        # Should keep last RECENT_LIMIT exchanges
+        assert len(mem.exchanges) == TelegramMemory.RECENT_LIMIT
+        assert mem.exchanges[0]["user"] == "question 2"
+        assert mem.summary == "Summary: user asked several questions."
+        mock_chat.assert_called_once()
+
+    @patch("agent.telegram_memory.chat_completion")
+    @patch("agent.telegram_memory.extract_assistant_message")
+    def test_compact_includes_existing_summary(self, mock_extract, mock_chat, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mock_extract.return_value = {"content": "Updated summary."}
+        mock_chat.return_value = {}
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        mem.summary = "Old summary from earlier."
+        for i in range(6):
+            mem.add_exchange(f"q{i}", f"a{i}")
+
+        mem.compact()
+
+        # Prompt should include the existing summary
+        prompt = mock_chat.call_args[0][0][1]["content"]
+        assert "Old summary from earlier." in prompt
+
+    def test_context_includes_summary(self, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        mem.summary = "User likes Python."
+        mem.add_exchange("what's new?", "not much")
+
+        msgs = mem.get_context_messages()
+        assert len(msgs) == 3  # summary system msg + 1 user + 1 assistant
+        assert msgs[0]["role"] == "system"
+        assert "User likes Python." in msgs[0]["content"]
+
+    @patch("agent.telegram_memory.chat_completion", side_effect=RuntimeError("LLM down"))
+    def test_compact_failure_preserves_messages(self, mock_chat, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        for i in range(6):
+            mem.add_exchange(f"q{i}", f"a{i}")
+
+        mem.compact()
+
+        # All messages should be preserved on failure
+        assert len(mem.exchanges) == 6
+
+    def test_clear(self, tmp_path):
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory(persist_path=tmp_path / "mem.json")
+        mem.summary = "some history"
+        mem.add_exchange("q", "a")
+        mem.clear()
+
+        assert mem.summary == ""
+        assert len(mem.exchanges) == 0
+
+    def test_handle_message_with_telegram_mem(self):
+        """_handle_telegram_message should inject context and record exchange."""
+        from agent.cli import _handle_telegram_message
+        from agent.telegram_memory import TelegramMemory
+
+        mem = TelegramMemory()
+        mem.add_exchange("earlier question", "earlier answer")
+
+        agent = MagicMock()
+        agent.run.return_value = "new answer"
+        agent.system_prompt = MagicMock()
+
+        bot = MagicMock()
+        bot.send.return_value = None
+        msg = IncomingMessage("new question", 20, False, "", "")
+        logger = logging.getLogger("test")
+
+        _handle_telegram_message(agent, bot, msg, logger, telegram_mem=mem)
+
+        # Agent should have gotten context messages injected
+        assert len(agent.messages) == 2  # earlier user + earlier assistant
+        # Exchange should be recorded
+        assert len(mem.exchanges) == 2
+        assert mem.exchanges[1]["user"] == "new question"
+        assert mem.exchanges[1]["assistant"] == "new answer"

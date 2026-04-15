@@ -10,7 +10,9 @@ The bot can:
 
 from __future__ import annotations
 
+import html as _html
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -23,6 +25,62 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 TELEGRAM_MAX_LENGTH = 4096
+
+
+def _esc(text: str) -> str:
+    """Escape text for safe inclusion in Telegram HTML messages."""
+    return _html.escape(text, quote=False)
+
+
+def _md_to_html(text: str) -> str:
+    """Convert standard Markdown to Telegram-compatible HTML.
+
+    Handles: **bold**, *italic*, `code`, ```code blocks```,
+    [text](url), ~~strikethrough~~.
+    """
+    placeholders: list[str] = []
+
+    def _save(match: re.Match) -> str:
+        idx = len(placeholders)
+        placeholders.append(match.group(0))
+        return f"\x00{idx}\x00"
+
+    # Protect code blocks (```lang\n...\n```) then inline code (`...`)
+    text = re.sub(r"```(?:\w*\n)?(.*?)```", _save, text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", _save, text)
+
+    # Escape HTML in remaining (non-code) text
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    # Italic: *text* or _text_ (not mid-word underscores like snake_case)
+    text = re.sub(r"(?<!\w)\*(.+?)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
+    # Strikethrough: ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    # Links: [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # Restore code placeholders with HTML escaping inside
+    def _restore(match: re.Match) -> str:
+        idx = int(match.group(1))
+        original = placeholders[idx]
+        if original.startswith("```"):
+            inner = re.sub(r"^```\w*\n?", "", original)
+            inner = inner.removesuffix("```")
+            inner = _html.escape(inner, quote=False)
+            return f"<pre>{inner}</pre>"
+        else:
+            inner = original[1:-1]
+            inner = _html.escape(inner, quote=False)
+            return f"<code>{inner}</code>"
+
+    text = re.sub(r"\x00(\d+)\x00", _restore, text)
+    return text
 
 
 def _split_message(text: str, limit: int = TELEGRAM_MAX_LENGTH) -> list[str]:
@@ -66,8 +124,8 @@ class TelegramBot:
         token: str | None = None,
         chat_id: str | None = None,
     ):
-        self.token = token or config.TELEGRAM_BOT_TOKEN
-        self.chat_id = chat_id or config.TELEGRAM_CHAT_ID
+        self.token = token if token is not None else config.TELEGRAM_BOT_TOKEN
+        self.chat_id = chat_id if chat_id is not None else config.TELEGRAM_CHAT_ID
         self._update_offset: int = 0  # tracks last seen update
 
     @property
@@ -96,18 +154,28 @@ class TelegramBot:
     def send(
         self,
         text: str,
-        parse_mode: str = "Markdown",
+        parse_mode: str = "HTML",
         reply_to: int | None = None,
     ) -> dict[str, Any] | None:
-        """Send a message to the configured chat."""
+        """Send a message to the configured chat.
+
+        If HTML parsing fails, retries as plain text.
+        """
         params: dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": parse_mode,
         }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         if reply_to:
             params["reply_to_message_id"] = reply_to
-        return self._call("sendMessage", **params)
+        result = self._call("sendMessage", **params)
+        if result is None and parse_mode:
+            # Markdown parse error — retry without formatting
+            logger.debug("Retrying send without parse_mode")
+            params.pop("parse_mode", None)
+            result = self._call("sendMessage", **params)
+        return result
 
     def reply(self, msg: IncomingMessage, text: str) -> dict[str, Any] | None:
         """Reply to a specific incoming message."""
@@ -117,7 +185,7 @@ class TelegramBot:
         self,
         text: str,
         reply_to: int | None = None,
-        parse_mode: str = "Markdown",
+        parse_mode: str = "HTML",
         limit: int = 4096,
     ) -> None:
         """Send a message, splitting into chunks if it exceeds Telegram's limit."""
@@ -127,7 +195,7 @@ class TelegramBot:
 
     def notify_idle(self, completed_count: int = 0) -> None:
         """Tell the user the queue is empty and ask for work."""
-        msg = "\U0001f4ed *Queue empty.*"
+        msg = "\U0001f4ed <b>Queue empty.</b>"
         if completed_count:
             msg += f" Completed {completed_count} job{'s' if completed_count != 1 else ''}."
         msg += (
@@ -137,32 +205,52 @@ class TelegramBot:
         self.send(msg)
 
     def notify_job_started(self, job: dict[str, Any]) -> None:
-        subject = job.get("subject", "unknown")
-        job_type = job.get("type", "job")
-        self.send(f"\u2699\ufe0f Starting {job_type}: *{subject}*")
+        subject = _esc(job.get("subject", "unknown"))
+        job_type = _esc(job.get("type", "job"))
+        self.send(f"\u2699\ufe0f Starting {job_type}: <b>{subject}</b>")
 
     def notify_job_done(self, job: dict[str, Any]) -> None:
-        subject = job.get("subject", "unknown")
+        subject = _esc(job.get("subject", "unknown"))
         duration = ""
         if job.get("started_at") and job.get("completed_at"):
             secs = int(job["completed_at"] - job["started_at"])
             mins, secs = divmod(secs, 60)
             duration = f" ({mins}m {secs}s)" if mins else f" ({secs}s)"
-        self.send(f"\u2705 Done: *{subject}*{duration}")
+        self.send(f"\u2705 Done: <b>{subject}</b>{duration}")
 
     def notify_job_failed(self, job: dict[str, Any]) -> None:
-        subject = job.get("subject", "unknown")
-        error = job.get("error", "unknown error")
+        subject = _esc(job.get("subject", "unknown"))
+        error = _esc(job.get("error", "unknown error"))
         if len(error) > 200:
             error = error[:200] + "..."
-        self.send(f"\u274c Failed: *{subject}*\n`{error}`")
+        self.send(f"\u274c Failed: <b>{subject}</b>\n<code>{error}</code>")
 
     def notify_shutdown(self, stats: dict[str, Any] | None = None) -> None:
-        msg = "\U0001f6d1 *Agent shutting down.*"
+        msg = "\U0001f6d1 <b>Agent shutting down.</b>"
         if stats:
             msg += f"\nJobs completed: {stats.get('jobs_completed', 0)}"
             msg += f"\nJobs in queue: {stats.get('jobs_queued', 0)}"
         self.send(msg)
+
+    def send_typing(self) -> None:
+        """Send a 'typing' chat action (lasts ~5 seconds)."""
+        self._call("sendChatAction", chat_id=self.chat_id, action="typing")
+
+    def edit_message(
+        self,
+        message_id: int,
+        text: str,
+        parse_mode: str = "",
+    ) -> dict[str, Any] | None:
+        """Edit an existing message by ID."""
+        params: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        return self._call("editMessageText", **params)
 
     # ── Receiving ─────────────────────────────────────────────────────
 
@@ -263,11 +351,11 @@ class TelegramBot:
 
     def _cmd_help(self, msg: IncomingMessage) -> None:
         self.reply(msg, (
-            "*Commands:*\n"
+            "<b>Commands:</b>\n"
             "/jobs — list recent jobs\n"
-            "/status — daemon & KB status\n"
-            "/queue `topic` — queue a research job\n"
-            "/cancel `job-id` — cancel a queued job\n"
+            "/status — daemon &amp; KB status\n"
+            "/queue <code>topic</code> — queue a research job\n"
+            "/cancel <code>job-id</code> — cancel a queued job\n"
             "/clear — remove done/failed jobs\n"
             "/help — this message\n"
             "\nOr just send me a message — I'll check the KB, "
@@ -289,15 +377,15 @@ class TelegramBot:
         }
         for j in jobs[:15]:  # cap at 15 to avoid message length limits
             emoji = status_emoji.get(j["status"], "\u2753")
-            subject = j["subject"]
+            subject = _esc(j["subject"])
             if len(subject) > 45:
                 subject = subject[:42] + "..."
-            lines.append(f"{emoji} `{j['status']:7s}` {subject}")
+            lines.append(f"{emoji} <code>{j['status']:7s}</code> {subject}")
 
         total = len(jobs)
         text = "\n".join(lines)
         if total > 15:
-            text += f"\n\n_...and {total - 15} more_"
+            text += f"\n\n<i>...and {total - 15} more</i>"
         self.reply(msg, text)
 
     def _cmd_status(
@@ -307,38 +395,38 @@ class TelegramBot:
         queued = Q.queue_size()
         total = len(Q.list_jobs())
         lines = [
-            f"*Queue:* {queued} pending, {total} total",
+            f"<b>Queue:</b> {queued} pending, {total} total",
         ]
         if agent_stats:
-            lines.append(f"*Turns:* {agent_stats.get('total_turns', 0)}")
-            lines.append(f"*Tool calls:* {agent_stats.get('total_tool_calls', 0)}")
+            lines.append(f"<b>Turns:</b> {agent_stats.get('total_turns', 0)}")
+            lines.append(f"<b>Tool calls:</b> {agent_stats.get('total_tool_calls', 0)}")
             kb = agent_stats.get("kb_stats", {})
             if kb:
-                lines.append(f"*KB:* {kb.get('entry_count', 0)} entries, {kb.get('total_tokens', 0)} tokens")
+                lines.append(f"<b>KB:</b> {kb.get('entry_count', 0)} entries, {kb.get('total_tokens', 0)} tokens")
         self.reply(msg, "\n".join(lines))
 
     def _cmd_queue(self, msg: IncomingMessage, Q: Any) -> None:
         topic = msg.args.strip()
         if not topic:
-            self.reply(msg, "Usage: /queue `topic to research`")
+            self.reply(msg, "Usage: /queue <code>topic to research</code>")
             return
         job = Q.add("research", topic)
-        self.reply(msg, f"\U0001f4cb Queued: *{topic}*\n`{job['id']}`")
+        self.reply(msg, f"\U0001f4cb Queued: <b>{_esc(topic)}</b>\n<code>{_esc(job['id'])}</code>")
 
     def _cmd_cancel(self, msg: IncomingMessage, Q: Any) -> None:
         job_id = msg.args.strip()
         if not job_id:
-            self.reply(msg, "Usage: /cancel `job-id`")
+            self.reply(msg, "Usage: /cancel <code>job-id</code>")
             return
         # Find matching job(s) — allow prefix match
         jobs = Q.list_jobs(status="queued")
         match = [j for j in jobs if j["id"] == job_id or j["id"].startswith(job_id)]
         if not match:
-            self.reply(msg, f"No queued job matching `{job_id}`")
+            self.reply(msg, f"No queued job matching <code>{_esc(job_id)}</code>")
             return
         for j in match:
             Q.mark_failed(j["id"], error="Cancelled via Telegram")
-        names = ", ".join(j["subject"] for j in match)
+        names = ", ".join(_esc(j["subject"]) for j in match)
         self.reply(msg, f"\U0001f6ab Cancelled: {names}")
 
     def _cmd_clear(self, msg: IncomingMessage, Q: Any) -> None:

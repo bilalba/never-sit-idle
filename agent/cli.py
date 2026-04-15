@@ -24,13 +24,15 @@ from agent import queue as Q
 from agent.agent import Agent
 from agent.memory import SystemPrompt
 from agent.prompts import (
+    DISCOVERY_PROMPT,
     EXPLORE_CODEBASE_PROMPT,
     RESEARCH_TOPIC_PROMPT,
     QUERY_KB_PROMPT,
     SYSTEM_PROMPT,
     TELEGRAM_CHAT_SYSTEM,
 )
-from agent.telegram import TelegramBot
+from agent.telegram import TelegramBot, _md_to_html
+from agent.telegram_memory import TelegramMemory
 
 
 LOG_DIR = Path(config.KNOWLEDGE_BASE_DIR) / ".logs"
@@ -96,19 +98,68 @@ def is_running() -> int | None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _prompt_for_job(job: dict, task_dir: str) -> str:
+def _prompt_for_job(job: dict) -> str:
     """Build the LLM prompt for a given job."""
     job_type = job["type"]
     subject = job["subject"]
 
     if job_type == Q.EXPLORE:
-        return EXPLORE_CODEBASE_PROMPT.format(task_dir=task_dir)
+        return EXPLORE_CODEBASE_PROMPT
     elif job_type == Q.RESEARCH:
-        return RESEARCH_TOPIC_PROMPT.format(topic=subject, task_dir=task_dir)
+        return RESEARCH_TOPIC_PROMPT.format(topic=subject)
     elif job_type == Q.QUERY:
-        return QUERY_KB_PROMPT.format(query=subject, task_dir=task_dir)
+        return QUERY_KB_PROMPT.format(query=subject)
     else:
-        return RESEARCH_TOPIC_PROMPT.format(topic=subject, task_dir=task_dir)
+        return RESEARCH_TOPIC_PROMPT.format(topic=subject)
+
+
+class _TelegramStreamer:
+    """Streams agent text to a Telegram message, editing it periodically."""
+
+    EDIT_INTERVAL = 1.0  # seconds between edits
+    CURSOR = " \u25cd"
+
+    def __init__(self, bot: TelegramBot, reply_to: int):
+        self.bot = bot
+        self.reply_to = reply_to
+        self.message_id: int | None = None
+        self.text = ""
+        self.last_edit = 0.0
+        self._last_sent = ""
+
+    def on_delta(self, delta: str) -> None:
+        self.text += delta
+        now = time.time()
+        if now - self.last_edit >= self.EDIT_INTERVAL:
+            self._update()
+
+    def _update(self) -> None:
+        display = self.text + self.CURSOR
+        if display == self._last_sent:
+            return
+        if self.message_id is None:
+            result = self.bot.send(display, parse_mode="", reply_to=self.reply_to)
+            if result:
+                self.message_id = result.get("message_id")
+        else:
+            self.bot.edit_message(self.message_id, display)
+        self._last_sent = display
+        self.last_edit = time.time()
+        self.bot.send_typing()
+
+    def finalize(self, full_text: str | None = None) -> None:
+        text = (full_text or self.text).strip() or "(No response)"
+        html = _md_to_html(text)
+        if self.message_id:
+            self.bot.edit_message(self.message_id, html, parse_mode="HTML")
+        else:
+            self.bot.send(html, parse_mode="HTML", reply_to=self.reply_to)
+
+    def abort(self, error_msg: str) -> None:
+        if self.message_id:
+            self.bot.edit_message(self.message_id, error_msg)
+        else:
+            self.bot.send(error_msg, parse_mode="", reply_to=self.reply_to)
 
 
 def _handle_telegram_message(
@@ -116,26 +167,37 @@ def _handle_telegram_message(
     bot: TelegramBot,
     msg: 'IncomingMessage',
     logger: logging.Logger,
+    telegram_mem: TelegramMemory | None = None,
 ) -> None:
     """Route a plain-text Telegram message through the agent and reply."""
-    # Ensure agent is in Telegram chat mode
     agent.system_prompt.text = TELEGRAM_CHAT_SYSTEM
 
+    if telegram_mem:
+        # Force-compact if conversation is very long
+        if telegram_mem.needs_force_compaction():
+            logger.info("Force-compacting telegram memory before responding")
+            telegram_mem.compact()
+        # Replace agent messages with clean context (no tool call artifacts)
+        agent.messages = telegram_mem.get_context_messages()
+
+    bot.send_typing()
+    streamer = _TelegramStreamer(bot, msg.message_id)
+
     try:
-        result = agent.run(msg.text)
+        result = agent.run(msg.text, on_text_delta=streamer.on_delta)
     except Exception as exc:
         logger.exception("Agent error handling Telegram message: %s", exc)
-        bot.reply(msg, f"Sorry, something went wrong: {exc}")
+        streamer.abort(f"Sorry, something went wrong: {exc}")
         return
 
-    if result.strip():
-        bot.send_long(result.strip(), reply_to=msg.message_id)
-    else:
-        bot.reply(msg, "(No response)")
+    if telegram_mem:
+        telegram_mem.add_exchange(msg.text, result)
+
+    streamer.finalize(result)
 
 
 def _run_job(agent: Agent, job: dict, logger: logging.Logger) -> None:
-    """Execute a single job: name task, run agent, update job status."""
+    """Execute a single job: run agent, update job status."""
     job_id = job["id"]
     job_type = job["type"]
     subject = job["subject"]
@@ -146,35 +208,53 @@ def _run_job(agent: Agent, job: dict, logger: logging.Logger) -> None:
 
     Q.mark_running(job_id)
 
-    # Name the task
-    if job_type == Q.EXPLORE:
-        task_desc = f"Explore codebase at {agent.codebase_root}"
-    else:
-        task_desc = f"{job_type.title()}: {subject}"
-
-    try:
-        task_dir = agent.name_task(task_desc)
-    except Exception as exc:
-        logger.warning("Failed to name task, using fallback: %s", exc)
-        task_dir = f"task-{job_id}"
-        agent.task_dir = task_dir
-
     # Set codebase root for explore jobs
     if job_type == Q.EXPLORE and subject:
         agent.codebase_root = Path(subject)
 
-    prompt = _prompt_for_job(job, task_dir)
+    prompt = _prompt_for_job(job)
 
-    logger.info("Running job %s: %s '%s' → %s/", job_id, job_type, subject[:80], task_dir)
+    logger.info("Running job %s: %s '%s'", job_id, job_type, subject[:80])
 
     try:
         result = agent.run(prompt)
         logger.info("Job %s complete. Result: %s", job_id, result[:200])
-        Q.mark_done(job_id, result_dir=task_dir)
+        Q.mark_done(job_id)
     except Exception as exc:
         logger.exception("Job %s failed: %s", job_id, exc)
         Q.mark_failed(job_id, error=str(exc))
         raise
+
+
+def _run_discovery(agent: Agent, logger: logging.Logger) -> int:
+    """Run a discovery cycle: scan trends/KB gaps and queue new topics.
+
+    Returns the number of jobs queued.
+    """
+    agent.reset_conversation()
+    agent.system_prompt.text = SYSTEM_PROMPT
+    agent.task_dir = None
+
+    # Gather recently completed topics to avoid re-researching
+    done_jobs = Q.list_jobs(status=Q.DONE)
+    recent = [j["subject"] for j in done_jobs[:20]]
+    recent_str = ", ".join(recent) if recent else "(none yet — this is a fresh start)"
+
+    prompt = DISCOVERY_PROMPT.format(recent_topics=recent_str)
+
+    before = Q.queue_size()
+    logger.info("Running discovery cycle (KB has %d entries, %d recent topics)",
+                agent.kb.stats().get("entry_count", 0), len(recent))
+
+    try:
+        agent.run(prompt)
+    except Exception as exc:
+        logger.exception("Discovery cycle failed: %s", exc)
+        return 0
+
+    queued = Q.queue_size() - before
+    logger.info("Discovery cycle complete — queued %d new jobs", queued)
+    return queued
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -186,18 +266,13 @@ def cmd_explore(args: argparse.Namespace) -> None:
     """Explore a codebase and build KB entries."""
     agent = _make_agent(args)
 
-    task_desc = f"Explore codebase at {agent.codebase_root}"
-    task_dir = agent.name_task(task_desc)
-    print(f"Task directory: {task_dir}/")
+    write_status({"mode": "explore", "state": "running", "codebase": str(agent.codebase_root)})
 
-    write_status({"mode": "explore", "state": "running", "codebase": str(agent.codebase_root), "task_dir": task_dir})
-
-    prompt = EXPLORE_CODEBASE_PROMPT.format(task_dir=task_dir)
     print(f"Exploring codebase at {agent.codebase_root}...")
-    for event in agent.run_streaming(prompt):
+    for event in agent.run_streaming(EXPLORE_CODEBASE_PROMPT):
         _print_event(event)
 
-    write_status({"mode": "explore", "state": "done", "task_dir": task_dir, **agent.stats()})
+    write_status({"mode": "explore", "state": "done", **agent.stats()})
     print("\nDone. KB tree:")
     print(agent.kb.tree())
 
@@ -207,17 +282,14 @@ def cmd_research(args: argparse.Namespace) -> None:
     agent = _make_agent(args)
     topic = args.topic
 
-    task_dir = agent.name_task(f"Research: {topic}")
-    print(f"Task directory: {task_dir}/")
+    write_status({"mode": "research", "state": "running", "topic": topic})
 
-    write_status({"mode": "research", "state": "running", "topic": topic, "task_dir": task_dir})
-
-    prompt = RESEARCH_TOPIC_PROMPT.format(topic=topic, task_dir=task_dir)
+    prompt = RESEARCH_TOPIC_PROMPT.format(topic=topic)
     print(f"Researching: {topic}")
     for event in agent.run_streaming(prompt):
         _print_event(event)
 
-    write_status({"mode": "research", "state": "done", "task_dir": task_dir, **agent.stats()})
+    write_status({"mode": "research", "state": "done", **agent.stats()})
 
 
 def cmd_query(args: argparse.Namespace) -> None:
@@ -225,16 +297,13 @@ def cmd_query(args: argparse.Namespace) -> None:
     agent = _make_agent(args)
     query = args.query
 
-    task_dir = agent.name_task(f"Query: {query}")
-    print(f"Task directory: {task_dir}/")
+    write_status({"mode": "query", "state": "running", "query": query})
 
-    write_status({"mode": "query", "state": "running", "query": query, "task_dir": task_dir})
-
-    prompt = QUERY_KB_PROMPT.format(query=query, task_dir=task_dir)
+    prompt = QUERY_KB_PROMPT.format(query=query)
     result = agent.run(prompt)
     print(result)
 
-    write_status({"mode": "query", "state": "done", "task_dir": task_dir, **agent.stats()})
+    write_status({"mode": "query", "state": "done", **agent.stats()})
 
 
 def cmd_daemon(args: argparse.Namespace) -> None:
@@ -265,7 +334,11 @@ def cmd_daemon(args: argparse.Namespace) -> None:
 
     agent = _make_agent(args)
     bot = TelegramBot()
+    telegram_mem = TelegramMemory(
+        persist_path=Path(config.KNOWLEDGE_BASE_DIR) / ".telegram_memory.json",
+    )
     idle_timeout = args.idle_timeout
+    auto_discover = not getattr(args, "no_discover", False)
     jobs_completed = 0
 
     # Seed the queue with any --topics passed on the command line
@@ -275,11 +348,11 @@ def cmd_daemon(args: argparse.Namespace) -> None:
         logger.info("Seeded queue with topic: %s", topic)
 
     logger.info(
-        "Daemon started (PID %d), idle_timeout=%ds, telegram=%s, queued=%d",
-        os.getpid(), idle_timeout, bot.enabled, Q.queue_size(),
+        "Daemon started (PID %d), idle_timeout=%ds, telegram=%s, auto_discover=%s, queued=%d",
+        os.getpid(), idle_timeout, bot.enabled, auto_discover, Q.queue_size(),
     )
     if bot.enabled:
-        bot.send("\u25b6\ufe0f *Agent started.* Watching queue for jobs.")
+        bot.send("\u25b6\ufe0f <b>Agent started.</b> Watching queue for jobs.")
 
     write_status({"mode": "daemon", "state": "running", "pid": os.getpid()})
 
@@ -315,7 +388,7 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                     topics = bot.handle_commands(pending, Q, agent_stats=agent.stats())
                     for msg in topics:
                         logger.info("Routing Telegram message through agent (between jobs): %s", msg.text[:100])
-                        _handle_telegram_message(agent, bot, msg, logger)
+                        _handle_telegram_message(agent, bot, msg, logger, telegram_mem)
 
             write_status({
                 "mode": "daemon", "state": "idle",
@@ -326,10 +399,41 @@ def cmd_daemon(args: argparse.Namespace) -> None:
             })
             continue  # immediately check for next job
 
-        # ── Queue is empty ────────────────────────────────────────
+        # ── Queue is empty — discover new topics or wait ─────────
+        # Drain any pending Telegram messages first
         if bot.enabled:
-            logger.info("Queue empty — waiting for Telegram messages")
-            bot.notify_idle(completed_count=jobs_completed)
+            pending = bot.poll_messages(timeout=0)
+            if pending:
+                tg_topics = bot.handle_commands(pending, Q, agent_stats=agent.stats())
+                for msg in tg_topics:
+                    logger.info("Routing Telegram message through agent: %s", msg.text[:100])
+                    _handle_telegram_message(agent, bot, msg, logger, telegram_mem)
+                if Q.queue_size() > 0:
+                    continue
+
+        # Auto-discover new topics
+        if auto_discover:
+            logger.info("Queue empty — running discovery cycle")
+            write_status({
+                "mode": "daemon", "state": "discovering",
+                "jobs_completed": jobs_completed,
+                "pid": os.getpid(),
+            })
+            bot.send("\U0001f50d <b>Queue empty.</b> Scanning for new topics...")
+            discovered = _run_discovery(agent, logger)
+
+            if discovered > 0:
+                bot.send(f"\U0001f4a1 Discovered {discovered} new topic{'s' if discovered != 1 else ''} — continuing.")
+                continue
+
+            # Discovery found nothing — fall through to wait
+            logger.info("Discovery found nothing new to queue")
+            bot.send("\U0001f4ad Discovery found nothing new. Waiting for input...")
+
+        # Wait for external input (Telegram or CLI `add`)
+        if bot.enabled:
+            if not auto_discover:
+                bot.notify_idle(completed_count=jobs_completed)
 
             write_status({
                 "mode": "daemon", "state": "waiting_for_input",
@@ -337,24 +441,21 @@ def cmd_daemon(args: argparse.Namespace) -> None:
                 "pid": os.getpid(),
             })
 
-            # Long-poll Telegram — route messages through the agent
             while not shutdown:
                 messages = bot.poll_messages(timeout=30)
                 if not messages:
-                    # Check if a job appeared (e.g. from external CLI `add`)
+                    if telegram_mem.needs_compaction() and telegram_mem.idle_long_enough():
+                        logger.info("Compacting telegram conversation memory")
+                        telegram_mem.compact()
                     if Q.queue_size() > 0:
                         break
                     continue
 
-                # Handle commands inline, get back plain-text messages
-                topics = bot.handle_commands(messages, Q, agent_stats=agent.stats())
-
-                # Route each message through the agent
-                for msg in topics:
+                tg_topics = bot.handle_commands(messages, Q, agent_stats=agent.stats())
+                for msg in tg_topics:
                     logger.info("Routing Telegram message through agent: %s", msg.text[:100])
-                    _handle_telegram_message(agent, bot, msg, logger)
+                    _handle_telegram_message(agent, bot, msg, logger, telegram_mem)
 
-                # If the agent queued any jobs, break out to process them
                 if Q.queue_size() > 0:
                     break
 
@@ -364,7 +465,6 @@ def cmd_daemon(args: argparse.Namespace) -> None:
             continue
 
         else:
-            # No Telegram — just sleep and re-check
             logger.info("Queue empty, sleeping %ds...", idle_timeout)
             write_status({
                 "mode": "daemon", "state": "idle_sleeping",
@@ -376,7 +476,6 @@ def cmd_daemon(args: argparse.Namespace) -> None:
             for _ in range(idle_timeout):
                 if shutdown:
                     break
-                # Wake up early if a job appears
                 if Q.queue_size() > 0:
                     break
                 time.sleep(1)
@@ -650,8 +749,11 @@ def main() -> None:
     p_daemon.add_argument("--kb-dir", type=str)
     p_daemon.add_argument("--idle-timeout", type=int, default=60,
                           help="Seconds to wait when queue is empty before re-checking (default 60)")
-    p_daemon.add_argument("--max-turns", type=int, default=30)
+    p_daemon.add_argument("--max-turns", type=int, default=100,
+                          help="Max LLM turns per job (default 100)")
     p_daemon.add_argument("--topics", nargs="*", help="Seed the queue with these research topics")
+    p_daemon.add_argument("--no-discover", action="store_true",
+                          help="Disable auto-discovery when queue is empty")
     p_daemon.set_defaults(func=cmd_daemon)
 
     # add (queue a job)

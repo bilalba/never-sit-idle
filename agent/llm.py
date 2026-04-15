@@ -93,15 +93,19 @@ def chat_completion(
     model = model or config.OPENROUTER_MODEL
     max_retries = max_retries if max_retries is not None else config.MAX_RETRIES
 
-    if not api_key:
+    is_openrouter = "openrouter.ai" in config.OPENROUTER_BASE_URL
+
+    if is_openrouter and not api_key:
         raise LLMError("OPENROUTER_API_KEY is not set")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
+    headers: dict[str, str] = {
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/never-sit-idle",
-        "X-Title": "never-sit-idle-agent",
     }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if is_openrouter:
+        headers["HTTP-Referer"] = "https://github.com/never-sit-idle"
+        headers["X-Title"] = "never-sit-idle-agent"
 
     body: dict[str, Any] = {
         "model": model,
@@ -164,6 +168,159 @@ def chat_completion(
             last_error = exc
             _backoff(attempt)
             continue
+
+    raise LLMRetryExhausted(last_error, max_retries)  # type: ignore[arg-type]
+
+
+def chat_completion_stream(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    *,
+    temperature: float = 0.3,
+    max_tokens: int = 4096,
+    api_key: str | None = None,
+    model: str | None = None,
+    max_retries: int | None = None,
+    on_delta: Any | None = None,
+) -> dict[str, Any]:
+    """Streaming chat completion — calls on_delta(text) for each text chunk.
+
+    Returns the same response dict as chat_completion once the stream ends.
+    Falls back to non-streaming if the server doesn't support SSE.
+    """
+    api_key = api_key or config.OPENROUTER_API_KEY
+    model = model or config.OPENROUTER_MODEL
+    max_retries = max_retries if max_retries is not None else config.MAX_RETRIES
+
+    is_openrouter = "openrouter.ai" in config.OPENROUTER_BASE_URL
+
+    if is_openrouter and not api_key:
+        raise LLMError("OPENROUTER_API_KEY is not set")
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if is_openrouter:
+        headers["HTTP-Referer"] = "https://github.com/never-sit-idle"
+        headers["X-Title"] = "never-sit-idle-agent"
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                config.OPENROUTER_BASE_URL,
+                headers=headers,
+                json=body,
+                timeout=120,
+                stream=True,
+            )
+
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                last_error = LLMError(f"HTTP {resp.status_code}")
+                _backoff(attempt)
+                continue
+
+            if resp.status_code != 200:
+                raise LLMError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+
+            # Parse SSE stream
+            content_parts: list[str] = []
+            tool_calls_acc: dict[int, dict] = {}
+            role = "assistant"
+            finish_reason = None
+            usage: dict[str, Any] = {}
+            response_id = ""
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                response_id = chunk.get("id", response_id)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+                if "role" in delta:
+                    role = delta["role"]
+
+                # Text content
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    if on_delta:
+                        on_delta(delta["content"])
+
+                # Tool calls (accumulated across chunks)
+                if "tool_calls" in delta:
+                    for tc_delta in delta["tool_calls"]:
+                        idx = tc_delta.get("index", 0)
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc_delta.get("id", f"call_{idx}"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        acc = tool_calls_acc[idx]
+                        fn_delta = tc_delta.get("function", {})
+                        if "name" in fn_delta:
+                            acc["function"]["name"] = fn_delta["name"]
+                        if "arguments" in fn_delta:
+                            acc["function"]["arguments"] += fn_delta["arguments"]
+
+            # Assemble final response in the same shape as non-streaming
+            message: dict[str, Any] = {
+                "role": role,
+                "content": "".join(content_parts),
+            }
+            if tool_calls_acc:
+                message["tool_calls"] = [
+                    tool_calls_acc[i] for i in sorted(tool_calls_acc)
+                ]
+
+            return {
+                "id": response_id,
+                "choices": [{"message": message, "finish_reason": finish_reason}],
+                "usage": usage,
+            }
+
+        except requests.exceptions.Timeout:
+            last_error = LLMError("Request timed out")
+            _backoff(attempt)
+        except requests.exceptions.ConnectionError as exc:
+            last_error = LLMError(f"Connection error: {exc}")
+            _backoff(attempt)
+        except LLMError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            _backoff(attempt)
 
     raise LLMRetryExhausted(last_error, max_retries)  # type: ignore[arg-type]
 

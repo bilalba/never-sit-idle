@@ -15,7 +15,9 @@ if _env_path.exists():
 # --- API ---
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_BASE_URL = os.environ.get(
+    "LLM_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
+)
 
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
 

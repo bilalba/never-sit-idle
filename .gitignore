@@ -22,6 +22,10 @@ env/
 # Knowledge base (generated content + runtime files)
 knowledge_base/
 
+# Deployment
+DEPLOYMENT.md
+daemon.log
+
 # Testing
 .pytest_cache/
 htmlcov/

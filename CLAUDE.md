@@ -28,8 +28,9 @@ agent/
     _filesystem.py    File-system tool implementations (read, glob, grep)
     _definitions.py   All tool registrations wired to sources/kb/memory
   queue.py          — File-based job queue (JSON files in kb/.queue/jobs/)
-  telegram.py       — Telegram bot: notifications, idle prompts, long-poll job intake
-  prompts.py        — System prompts for explore/research/query modes
+  telegram.py       — Telegram bot: HTML formatting, notifications, long-poll job intake
+  telegram_memory.py — Conversation context persistence with LLM-based compaction
+  prompts.py        — System prompts for explore/research/query/discovery modes
   agent.py          — Core loop: build messages → LLM call → parse tool calls → execute → repeat
   cli.py            — CLI with daemon mode, job queue, PID tracking, log files, graceful shutdown
 tests/              — 215 tests covering all modules
@@ -41,8 +42,11 @@ tests/              — 215 tests covering all modules
 - **Rate limiting**: All HTTP sources go through a centralized `RateLimiter` in `sources/_base.py` that tracks both window-based (requests in last 60s) and header-based (`x-ratelimit-remaining`) limits. Reddit is capped at 30/min.
 - **Memory budget**: LTM has a hard 50k token cap measured via tiktoken `cl100k_base`. Writes that would exceed the budget are rejected with ValueError.
 - **Job queue**: File-based queue in `kb/.queue/jobs/`. Each job is a JSON file with status transitions: queued → running → done/failed. The daemon polls for queued jobs; CLI `add` command writes new job files. No IPC — filesystem is the coordination layer.
-- **Telegram bot**: Batch-drains all pending messages each poll cycle. Plain text → queued as research with reply confirmation. Commands (`/jobs`, `/status`, `/queue`, `/cancel`, `/clear`, `/help`) are handled inline. Between jobs, drains any messages that arrived while running. When idle, long-polls Telegram for input. Degrades gracefully — if no token configured, the daemon just sleeps and re-checks the queue.
-- **Background-first**: The daemon runs in the foreground (no forking — Python antipattern). Use tmux/nohup/systemd to background it. Logs to files, writes PID/status files, handles SIGTERM gracefully.
+- **Telegram bot**: Batch-drains all pending messages each poll cycle. Plain text is routed through the agent for conversational replies. Commands (`/jobs`, `/status`, `/queue`, `/cancel`, `/clear`, `/help`) are handled inline. Uses HTML parse_mode with `_md_to_html()` converter for formatting. Conversation context is persisted in `telegram_memory.py` with LLM-based compaction.
+- **Auto-discovery**: When the queue empties, the daemon runs a discovery cycle — scans HN, Google News, Reddit for trending topics, cross-references with existing KB, and queues 3-5 new research topics. Disable with `--no-discover`.
+- **KB enrichment over isolation**: Research jobs do NOT create isolated per-job directories. The model checks existing KB entries first and enriches them with new findings. New entries go under logical paths (`topics/`, `architecture/`, etc.).
+- **Self-seeding**: Research and explore prompts instruct the model to `queue_research` 2-4 follow-up topics before finishing, creating a natural graph expansion of knowledge.
+- **Background-first**: The daemon runs in the foreground (no forking — Python antipattern). Use nohup/tmux/systemd to background it. Logs to files, writes PID/status files, handles SIGTERM gracefully.
 - **No React/Ink CLI**: Deliberately kept as plain Python since the agent primarily runs unattended in background.
 
 ## Running
@@ -57,8 +61,9 @@ python run.py query "question"
 python run.py add research "React hooks"
 python run.py add research "FastAPI best practices"
 python run.py add explore /path/to/repo
-python run.py daemon                              # processes queue, asks Telegram when idle
+python run.py daemon                              # processes queue, auto-discovers when idle
 python run.py daemon --topics "React hooks"       # seeds queue then starts
+python run.py daemon --no-discover                # manual mode — no auto-discovery
 
 # Queue management
 python run.py jobs                                # list all jobs
@@ -68,6 +73,10 @@ python run.py status
 python run.py stop
 python run.py tree
 ```
+
+## Deployment
+
+Production runs on `ssh studio`. See `DEPLOYMENT.md` (gitignored) for rsync commands, venv setup, and daemon management. If the file is missing, check git history or the memory system for deployment details.
 
 ## Environment
 
@@ -81,7 +90,7 @@ python run.py tree
 python -m pytest tests/ -v
 ```
 
-All 215 tests pass. Tests use mocks for HTTP/LLM calls — no live API calls in tests.
+All 237 tests pass. Tests use mocks for HTTP/LLM calls — no live API calls in tests.
 
 ## Known issues / next steps
 
